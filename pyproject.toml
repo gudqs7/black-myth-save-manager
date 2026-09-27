@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "black-myth-save-manager"
+version = "1.4.0"
+description = "A Windows GUI save manager for Black Myth: Wukong."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gudqs7" }]
+keywords = ["black-myth-wukong", "save-manager", "tkinter", "windows"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Games/Entertainment",
+]
+
+[project.gui-scripts]
+black-myth-save-manager = "black_myth_save_manager:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["black_myth_save_manager"]
