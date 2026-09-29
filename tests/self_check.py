@@ -37,6 +37,12 @@ def main() -> None:
         assert warnings == []
         assert (locked_destination / "UserSettingSaveGame.sav").read_bytes() == b"locked-settings"
 
+        fresh_destination = base / "game" / "fresh"
+        fresh_destination.mkdir()
+        warnings = app.apply_save_folder(source, fresh_destination)
+        assert warnings == []
+        assert (fresh_destination / "UserSettingSaveGame.sav").read_bytes() == b"source-settings"
+
         empty = base / "archive" / "empty"
         empty.mkdir()
         root, nodes = app.scan_save_tree(base / "archive")

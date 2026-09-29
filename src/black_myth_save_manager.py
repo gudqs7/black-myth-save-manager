@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_NAME = "黑猴存档管理"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 SETTINGS_VERSION = 1
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
@@ -449,9 +449,10 @@ def copy_tree_in_place(source: Path, destination: Path) -> list[str]:
         target_dir = destination / relative
         target_dir.mkdir(parents=True, exist_ok=True)
         for name in file_names:
-            if name.casefold() == USER_SETTING_SAVE.casefold():
+            target = target_dir / name
+            if name.casefold() == USER_SETTING_SAVE.casefold() and target.exists():
                 continue
-            shutil.copy2(current / name, target_dir / name)
+            shutil.copy2(current / name, target)
 
     for current_text, dir_names, file_names in os.walk(destination, topdown=False):
         current = Path(current_text)
@@ -495,11 +496,7 @@ def apply_save_folder(source: Path, destination: Path, allow_locked: bool = Fals
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
-        shutil.copytree(
-            source,
-            destination,
-            ignore=shutil.ignore_patterns(USER_SETTING_SAVE),
-        )
+        shutil.copytree(source, destination)
         return []
 
     if allow_locked:
@@ -514,11 +511,7 @@ def apply_save_folder(source: Path, destination: Path, allow_locked: bool = Fals
     old = destination.parent / f".bmw_old_{destination.name}_{token}"
     if temp.exists():
         shutil.rmtree(temp)
-    shutil.copytree(
-        source,
-        temp,
-        ignore=shutil.ignore_patterns(USER_SETTING_SAVE),
-    )
+    shutil.copytree(source, temp)
     preserved_setting = destination / USER_SETTING_SAVE
     if preserved_setting.is_file():
         shutil.copy2(preserved_setting, temp / USER_SETTING_SAVE)
@@ -546,11 +539,7 @@ def sync_tree_in_place(source: Path, destination: Path) -> None:
     staging = destination.parent / f".bmw_stage_{destination.name}_{token}"
     if staging.exists():
         shutil.rmtree(staging)
-    shutil.copytree(
-        source,
-        staging,
-        ignore=shutil.ignore_patterns(USER_SETTING_SAVE),
-    )
+    shutil.copytree(source, staging)
     preserved_setting = destination / USER_SETTING_SAVE
     if preserved_setting.is_file():
         shutil.copy2(preserved_setting, staging / USER_SETTING_SAVE)
@@ -1417,11 +1406,11 @@ class SaveManagerApp:
             self.root.configure(cursor="")
 
         if backup_path is not None:
-            message = f"覆盖完成，原当前存档已备份到：\n{backup_path}"
-            self._set_status(f"覆盖完成，已备份到 {backup_path}")
+            message = f"存档：{source.name}\n覆盖完成，原当前存档已备份到：\n{backup_path}"
+            self._set_status(f"覆盖完成：{source.name}，已备份到 {backup_path}")
         else:
-            message = "覆盖完成。"
-            self._set_status(f"覆盖完成：{destination}")
+            message = f"存档：{source.name}\n覆盖完成。"
+            self._set_status(f"覆盖完成：{source.name} -> {destination}")
         if game_running:
             message += "\n\n游戏当前正在运行：请回到标题界面并重新读取存档。"
         if warnings:
