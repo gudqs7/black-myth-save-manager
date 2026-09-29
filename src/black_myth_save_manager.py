@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_NAME = "黑猴存档管理"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 SETTINGS_VERSION = 1
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
@@ -1379,6 +1379,7 @@ class SaveManagerApp:
         game_running = is_game_running()
 
         preference = self.runtime_backup_preference
+        remembered = preference is not None
         if preference is None:
             dialog = BackupPrompt(self.root, source.path, destination, game_running=game_running)
             self.root.wait_window(dialog)
@@ -1389,20 +1390,8 @@ class SaveManagerApp:
             if dialog.remember:
                 self.runtime_backup_preference = preference
         else:
-            will_backup = "先备份" if preference == "backup" else "不备份"
-            running_note = (
-                "\n\n检测到游戏正在运行：覆盖会继续；请先回到标题界面，覆盖后重新读取存档。"
-                if game_running else ""
-            )
-            confirmed = messagebox.askyesno(
-                "确认覆盖存档",
-                f"即将用所选存档{will_backup}后覆盖当前存档。\n\n"
-                f"来源：{source.path}\n目标：{destination}{running_note}\n\n是否继续？",
-                parent=self.root,
-            )
-            if not confirmed:
-                self._set_status("已取消覆盖。")
-                return
+            will_backup = "自动备份" if preference == "backup" else "直接覆盖"
+            self._set_status(f"按本次运行记住的方式执行：{will_backup}")
 
         backup_path: Path | None = None
         self.root.configure(cursor="watch")
@@ -1437,7 +1426,9 @@ class SaveManagerApp:
             message += "\n\n游戏当前正在运行：请回到标题界面并重新读取存档。"
         if warnings:
             message += "\n\n以下旧文件未能清理（通常正在被游戏占用）：\n" + "\n".join(warnings[:8])
-        messagebox.showinfo("操作完成", message, parent=self.root)
+            messagebox.showwarning("操作完成", message, parent=self.root)
+        elif not remembered:
+            messagebox.showinfo("操作完成", message, parent=self.root)
 
     def _valid_save_name(self, name: str) -> str | None:
         name = name.strip()
