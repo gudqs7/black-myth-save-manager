@@ -21,9 +21,10 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_NAME = "黑猴存档管理"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 SETTINGS_VERSION = 1
 DEFAULT_ARCHIVE_ROOT: Path | None = None
+USER_SETTING_SAVE = "UserSettingSaveGame.sav"
 STARTUPINFO = None
 if os.name == "nt":
     STARTUPINFO = subprocess.STARTUPINFO()
@@ -448,12 +449,16 @@ def copy_tree_in_place(source: Path, destination: Path) -> list[str]:
         target_dir = destination / relative
         target_dir.mkdir(parents=True, exist_ok=True)
         for name in file_names:
+            if name.casefold() == USER_SETTING_SAVE.casefold():
+                continue
             shutil.copy2(current / name, target_dir / name)
 
     for current_text, dir_names, file_names in os.walk(destination, topdown=False):
         current = Path(current_text)
         relative = current.relative_to(destination)
         for name in file_names:
+            if name.casefold() == USER_SETTING_SAVE.casefold():
+                continue
             source_file = source / relative / name
             if source_file.is_file():
                 continue
@@ -490,7 +495,11 @@ def apply_save_folder(source: Path, destination: Path, allow_locked: bool = Fals
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
-        shutil.copytree(source, destination)
+        shutil.copytree(
+            source,
+            destination,
+            ignore=shutil.ignore_patterns(USER_SETTING_SAVE),
+        )
         return []
 
     if allow_locked:
@@ -505,7 +514,14 @@ def apply_save_folder(source: Path, destination: Path, allow_locked: bool = Fals
     old = destination.parent / f".bmw_old_{destination.name}_{token}"
     if temp.exists():
         shutil.rmtree(temp)
-    shutil.copytree(source, temp)
+    shutil.copytree(
+        source,
+        temp,
+        ignore=shutil.ignore_patterns(USER_SETTING_SAVE),
+    )
+    preserved_setting = destination / USER_SETTING_SAVE
+    if preserved_setting.is_file():
+        shutil.copy2(preserved_setting, temp / USER_SETTING_SAVE)
     moved_old = False
     try:
         os.replace(destination, old)
@@ -530,7 +546,14 @@ def sync_tree_in_place(source: Path, destination: Path) -> None:
     staging = destination.parent / f".bmw_stage_{destination.name}_{token}"
     if staging.exists():
         shutil.rmtree(staging)
-    shutil.copytree(source, staging)
+    shutil.copytree(
+        source,
+        staging,
+        ignore=shutil.ignore_patterns(USER_SETTING_SAVE),
+    )
+    preserved_setting = destination / USER_SETTING_SAVE
+    if preserved_setting.is_file():
+        shutil.copy2(preserved_setting, staging / USER_SETTING_SAVE)
     try:
         for item in list(destination.iterdir()):
             if item.is_dir() and not item.is_symlink():

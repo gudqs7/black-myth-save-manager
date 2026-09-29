@@ -19,13 +19,23 @@ def main() -> None:
         source.mkdir(parents=True)
         destination.mkdir(parents=True)
         (source / "ArchiveSaveFile.2.sav").write_bytes(b"new")
+        (source / "UserSettingSaveGame.sav").write_bytes(b"source-settings")
         (destination / "ArchiveSaveFile.1.sav").write_bytes(b"old")
         (destination / "ArchiveSaveFile.2.sav").write_bytes(b"old")
+        (destination / "UserSettingSaveGame.sav").write_bytes(b"current-settings")
 
         warnings = app.apply_save_folder(source, destination)
         assert warnings == []
         assert (destination / "ArchiveSaveFile.2.sav").read_bytes() == b"new"
         assert not (destination / "ArchiveSaveFile.1.sav").exists()
+        assert (destination / "UserSettingSaveGame.sav").read_bytes() == b"current-settings"
+
+        locked_destination = base / "game" / "locked"
+        locked_destination.mkdir()
+        (locked_destination / "UserSettingSaveGame.sav").write_bytes(b"locked-settings")
+        warnings = app.apply_save_folder(source, locked_destination, allow_locked=True)
+        assert warnings == []
+        assert (locked_destination / "UserSettingSaveGame.sav").read_bytes() == b"locked-settings"
 
         empty = base / "archive" / "empty"
         empty.mkdir()
