@@ -1,4 +1,8 @@
-# 黑猴存档管理
+<p align="center">
+  <img src="assets/logo.png" alt="黑猴存档管理 Logo" width="96" height="96">
+</p>
+
+<h1 align="center">黑猴存档管理</h1>
 
 一个面向 Windows 的《黑神话：悟空》存档管理 GUI。用于浏览、备份、覆盖、整理和瘦身本地存档，不修改游戏本体。
 
