@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_NAME = "黑猴存档管理"
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.5.4"
 SETTINGS_VERSION = 1
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
@@ -784,20 +784,13 @@ class SaveManagerApp:
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.icon_photo = None
         icon_ico = asset_path("logo.ico")
-        icon_png = asset_path("logo.png")
         if icon_ico.is_file():
             try:
+                self.root.iconbitmap(str(icon_ico))
                 self.root.iconbitmap(default=str(icon_ico))
             except tk.TclError:
                 pass
-        if icon_png.is_file():
-            try:
-                self.icon_photo = tk.PhotoImage(file=str(icon_png))
-                self.root.iconphoto(True, self.icon_photo)
-            except tk.TclError:
-                self.icon_photo = None
         self.dpi_scale = configure_tk_scaling(self.root)
         desired_width = min(self._px(1480), max(self._px(980), self.root.winfo_screenwidth() - self._px(40)))
         desired_height = min(self._px(820), max(self._px(560), self.root.winfo_screenheight() - self._px(100)))
