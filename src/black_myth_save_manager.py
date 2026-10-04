@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_NAME = "黑猴存档管理"
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
 SETTINGS_VERSION = 1
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
