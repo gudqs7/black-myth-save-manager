@@ -20,15 +20,85 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
-APP_NAME = "黑猴存档管理"
-APP_VERSION = "1.5.7"
-SETTINGS_VERSION = 1
+APP_NAME = "黑猴 / 影之刃零存档管理"
+APP_VERSION = "1.6.0"
+SETTINGS_VERSION = 2
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
+BMW_GAME_KEY = "black_myth_wukong"
+PBZ_GAME_KEY = "phantom_blade_zero"
+PBZ_SAVE_FILE = "PBZSaveGame.sav"
+ARCHIVE_SAVE_PREFIX = "archivesavefile"
+BMW_SLIM_KEEP_FILE = "ArchiveSaveFile.2.sav"
 STARTUPINFO = None
 if os.name == "nt":
     STARTUPINFO = subprocess.STARTUPINFO()
     STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+
+@dataclass(frozen=True)
+class GameProfile:
+    key: str
+    display_name: str
+    steam_install_dir: str
+    save_relative_paths: tuple[tuple[str, ...], ...]
+    process_names: tuple[str, ...]
+    exact_save_file: str | None = None
+
+    @property
+    def exact_file_mode(self) -> bool:
+        return self.exact_save_file is not None
+
+    @property
+    def slim_keep_file(self) -> str:
+        return self.exact_save_file or BMW_SLIM_KEEP_FILE
+
+    def matches_save_name(self, name: str) -> bool:
+        if self.exact_save_file is not None:
+            return name.casefold() == self.exact_save_file.casefold()
+        return Path(name).suffix.casefold() == ".sav"
+
+    def matches_library_file(self, name: str) -> bool:
+        if self.exact_save_file is not None:
+            return self.matches_save_name(name)
+        return True
+
+    def matches_detection_save(self, name: str) -> bool:
+        if self.exact_save_file is not None:
+            return self.matches_save_name(name)
+        return (
+            name.casefold().startswith(ARCHIVE_SAVE_PREFIX)
+            and Path(name).suffix.casefold() == ".sav"
+        )
+
+    def matches_slim_source(self, name: str) -> bool:
+        return self.matches_detection_save(name)
+
+
+BMW_GAME = GameProfile(
+    key=BMW_GAME_KEY,
+    display_name="黑神话：悟空",
+    steam_install_dir="BlackMythWukong",
+    save_relative_paths=(
+        ("b1", "Saved", "SaveGames"),
+        ("b1", "Saved", "SaveGames", "SaveGames"),
+    ),
+    process_names=("b1-Win64-Shipping.exe", "BlackMythWukong.exe"),
+)
+PBZ_GAME = GameProfile(
+    key=PBZ_GAME_KEY,
+    display_name="影之刃零",
+    steam_install_dir="PBZ",
+    save_relative_paths=(
+        ("ProjectPBZ", "Saved", "SaveGames", "Steam"),
+        ("ProjectPBZ", "Saved", "SaveGames"),
+    ),
+    process_names=("PBZ.exe", "ProjectPBZ-Win64-Shipping.exe", "PBZ-Win64-Shipping.exe"),
+    exact_save_file=PBZ_SAVE_FILE,
+)
+GAME_PROFILES = {profile.key: profile for profile in (BMW_GAME, PBZ_GAME)}
+GAME_BY_DISPLAY_NAME = {profile.display_name: profile for profile in GAME_PROFILES.values()}
+DEFAULT_GAME = BMW_GAME
 
 
 def asset_path(name: str) -> Path:
@@ -78,6 +148,41 @@ def save_settings(data: dict) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def normalize_game_settings(settings: dict) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    raw_games = settings.get("games")
+    if isinstance(raw_games, dict):
+        for game_key, raw_value in raw_games.items():
+            if game_key not in GAME_PROFILES or not isinstance(raw_value, dict):
+                continue
+            result[game_key] = {
+                name: str(raw_value.get(name) or "").strip()
+                for name in ("source_directory", "current_save_directory")
+            }
+
+    legacy_source = str(settings.get("source_directory") or "").strip()
+    legacy_current = str(settings.get("current_save_directory") or "").strip()
+    if legacy_source or legacy_current:
+        bmw = result.setdefault(BMW_GAME_KEY, {})
+        if legacy_source and not bmw.get("source_directory"):
+            bmw["source_directory"] = legacy_source
+        if legacy_current and not bmw.get("current_save_directory"):
+            bmw["current_save_directory"] = legacy_current
+
+    for game_key in GAME_PROFILES:
+        result.setdefault(game_key, {"source_directory": "", "current_save_directory": ""})
+    return result
+
+
+def initial_game_key(settings: dict) -> str:
+    value = str(settings.get("game") or "").strip()
+    return value if value in GAME_PROFILES else BMW_GAME_KEY
+
+
+def game_for_display_name(display_name: str) -> GameProfile:
+    return GAME_BY_DISPLAY_NAME.get(display_name, DEFAULT_GAME)
 
 
 def natural_key(value: str):
@@ -186,14 +291,18 @@ def discover_steam_libraries() -> set[Path]:
     return {path for path in libraries if path.exists()}
 
 
-def discover_savegames_roots() -> list[Path]:
+def discover_savegames_roots(game: GameProfile = DEFAULT_GAME) -> list[Path]:
     roots: dict[str, Path] = {}
     candidates: set[Path] = set()
+    install_roots: set[Path] = set()
     for library in discover_steam_libraries():
-        candidates.add(library / "common" / "BlackMythWukong" / "b1" / "Saved" / "SaveGames")
-        candidates.add(library / "common" / "BlackMythWukong" / "b1" / "Saved" / "SaveGames" / "SaveGames")
-    candidates.add(Path(r"E:\SteamLibrary\steamapps\common\BlackMythWukong\b1\Saved\SaveGames"))
-    candidates.add(Path(r"C:\Program Files (x86)\Steam\steamapps\common\BlackMythWukong\b1\Saved\SaveGames"))
+        install_roots.add(library / "common" / game.steam_install_dir)
+    install_roots.add(Path(r"E:\SteamLibrary\steamapps\common") / game.steam_install_dir)
+    install_roots.add(Path(r"C:\Program Files (x86)\Steam\steamapps\common") / game.steam_install_dir)
+
+    for install_root in install_roots:
+        for relative_parts in game.save_relative_paths:
+            candidates.add(install_root.joinpath(*relative_parts))
 
     for candidate in candidates:
         if not candidate.is_dir():
@@ -216,18 +325,30 @@ def direct_save_files(folder: Path) -> list[Path]:
         return []
 
 
-def is_archive_save_folder(folder: Path) -> bool:
-    files = direct_save_files(folder)
-    if not files:
+def valid_save_files(folder: Path, game: GameProfile = DEFAULT_GAME) -> list[Path]:
+    return [item for item in direct_save_files(folder) if game.matches_save_name(item.name)]
+
+
+def find_save_file(folder: Path, game: GameProfile = DEFAULT_GAME) -> Path | None:
+    files = valid_save_files(folder, game)
+    return files[0] if files else None
+
+
+def is_archive_save_folder(folder: Path, game: GameProfile = DEFAULT_GAME) -> bool:
+    try:
+        return any(
+            item.is_file() and game.matches_detection_save(item.name)
+            for item in folder.iterdir()
+        )
+    except OSError:
         return False
-    return any(item.name.casefold().startswith("archivesavefile") for item in files)
 
 
-def folder_score(folder: Path, depth: int = 0) -> float:
-    files = direct_save_files(folder)
+def folder_score(folder: Path, depth: int = 0, game: GameProfile = DEFAULT_GAME) -> float:
+    files = valid_save_files(folder, game)
     if not files:
         return float("-inf")
-    archive_files = [item for item in files if item.name.casefold().startswith("archivesavefile")]
+    archive_files = [item for item in files if game.matches_slim_source(item.name)]
     newest = 0.0
     for item in files:
         try:
@@ -238,7 +359,11 @@ def folder_score(folder: Path, depth: int = 0) -> float:
     return useful * 1000000 + newest - depth * 500000
 
 
-def detect_actual_save_folder(folder: Path, max_depth: int = 2) -> Path | None:
+def detect_actual_save_folder(
+    folder: Path,
+    max_depth: int = 2,
+    game: GameProfile = DEFAULT_GAME,
+) -> Path | None:
     folder = Path(folder)
     if not folder.is_dir():
         return None
@@ -253,8 +378,8 @@ def detect_actual_save_folder(folder: Path, max_depth: int = 2) -> Path | None:
         stack: list[tuple[Path, int]] = [(child, 1)]
         while stack:
             current, depth = stack.pop()
-            if is_archive_save_folder(current):
-                candidates.append((folder_score(current, depth), current))
+            if is_archive_save_folder(current, game):
+                candidates.append((folder_score(current, depth, game), current))
             if depth >= max_depth:
                 continue
             try:
@@ -267,12 +392,15 @@ def detect_actual_save_folder(folder: Path, max_depth: int = 2) -> Path | None:
     if candidates:
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates[0][1]
-    if is_archive_save_folder(folder):
+    if is_archive_save_folder(folder, game):
         return folder
     return None
 
 
-def resolve_current_save_folder(path: Path | str | None) -> Path | None:
+def resolve_current_save_folder(
+    path: Path | str | None,
+    game: GameProfile = DEFAULT_GAME,
+) -> Path | None:
     if path is None:
         return None
     text = str(path).strip().strip('"')
@@ -281,18 +409,18 @@ def resolve_current_save_folder(path: Path | str | None) -> Path | None:
     folder = Path(text)
     if not folder.is_dir():
         return None
-    detected = detect_actual_save_folder(folder)
+    detected = detect_actual_save_folder(folder, game=game)
     if detected is not None:
         return detected
     return folder
 
 
-def auto_detect_current_save() -> Path | None:
-    for root in discover_savegames_roots():
-        detected = detect_actual_save_folder(root)
+def auto_detect_current_save(game: GameProfile = DEFAULT_GAME) -> Path | None:
+    for root in discover_savegames_roots(game):
+        detected = detect_actual_save_folder(root, game=game)
         if detected is not None:
             return detected
-        if root.name.casefold() == "savegames":
+        if not game.exact_file_mode and root.name.casefold() == "savegames":
             try:
                 children = [item for item in root.iterdir() if item.is_dir()]
             except OSError:
@@ -321,20 +449,28 @@ class SaveNode:
     total_size: int = 0
     total_save_dirs: int = 0
     modified: float = 0.0
+    game: GameProfile = DEFAULT_GAME
 
     @property
     def is_save_dir(self) -> bool:
-        return any(item.path.suffix.casefold() == '.sav' for item in self.direct_files)
+        return any(self.game.matches_save_name(item.name) for item in self.direct_files)
+
+    @property
+    def display_files(self) -> list[ScanFile]:
+        return [item for item in self.direct_files if self.game.matches_library_file(item.name)]
 
     @property
     def direct_save_count(self) -> int:
-        return sum(1 for item in self.direct_files if item.name.casefold().startswith("archivesavefile"))
+        return sum(1 for item in self.direct_files if self.game.matches_slim_source(item.name))
 
     def relative_path(self, root: Path) -> str:
         return safe_relative(self.path, root)
 
 
-def scan_save_tree(root: Path) -> tuple[SaveNode, dict[str, SaveNode]]:
+def scan_save_tree(
+    root: Path,
+    game: GameProfile = DEFAULT_GAME,
+) -> tuple[SaveNode, dict[str, SaveNode]]:
     root = Path(root)
     if not root.is_dir():
         raise NotADirectoryError(str(root))
@@ -370,6 +506,7 @@ def scan_save_tree(root: Path) -> tuple[SaveNode, dict[str, SaveNode]]:
             name=current.name or str(current),
             direct_files=files,
             modified=max(newest, folder_modified),
+            game=game,
         )
 
     root_node = nodes[str(root)]
@@ -399,7 +536,32 @@ def scan_save_tree(root: Path) -> tuple[SaveNode, dict[str, SaveNode]]:
     return root_node, nodes
 
 
-def backup_current_save(source: Path, destination: Path) -> Path:
+def node_has_slim_source(node: SaveNode) -> bool:
+    if any(node.game.matches_slim_source(item.name) for item in node.direct_files):
+        return True
+    return any(node_has_slim_source(child) for child in node.children)
+
+
+def node_has_slim_target(node: SaveNode) -> bool:
+    keep_name = node.game.slim_keep_file.casefold()
+    if any(item.name.casefold() == keep_name for item in node.direct_files):
+        return True
+    return any(node_has_slim_target(child) for child in node.children)
+
+
+def collect_slim_targets(node: SaveNode) -> list[Path]:
+    keep_name = node.game.slim_keep_file.casefold()
+    targets = [item.path for item in node.direct_files if item.name.casefold() != keep_name]
+    for child in node.children:
+        targets.extend(collect_slim_targets(child))
+    return targets
+
+
+def backup_current_save(
+    source: Path,
+    destination: Path,
+    game: GameProfile = DEFAULT_GAME,
+) -> Path:
     destination = Path(destination)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     folder_name = destination.name or "SaveGames"
@@ -411,6 +573,8 @@ def backup_current_save(source: Path, destination: Path) -> Path:
     shutil.copytree(destination, backup_path)
     metadata = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "game": game.key,
+        "game_name": game.display_name,
         "source_archive": str(source),
         "original_current_path": str(destination),
     }
@@ -485,12 +649,52 @@ def copy_tree_in_place(source: Path, destination: Path) -> list[str]:
     return warnings
 
 
-def apply_save_folder(source: Path, destination: Path, allow_locked: bool = False) -> list[str]:
+def copy_exact_save_file(source_file: Path, target: Path, allow_locked: bool = False) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".save_manager_{uuid.uuid4().hex[:10]}.tmp")
+    try:
+        shutil.copy2(source_file, temp)
+        try:
+            os.replace(temp, target)
+        except OSError:
+            if not allow_locked:
+                raise
+            shutil.copy2(source_file, target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def copy_save_folder(
+    source: Path,
+    destination: Path,
+    game: GameProfile = DEFAULT_GAME,
+) -> None:
+    source = Path(source)
+    destination = Path(destination)
+    if game.exact_save_file is None:
+        shutil.copytree(source, destination)
+        return
+    source_file = find_save_file(source, game)
+    if source_file is None:
+        raise FileNotFoundError(f"源存档目录中没有 {game.slim_keep_file}。")
+    destination.mkdir(parents=True, exist_ok=False)
+    copy_exact_save_file(source_file, destination / game.exact_save_file)
+
+
+def apply_save_folder(
+    source: Path,
+    destination: Path,
+    allow_locked: bool = False,
+    game: GameProfile = DEFAULT_GAME,
+) -> list[str]:
     source = Path(source).resolve()
     destination = Path(destination).resolve()
     if not source.is_dir():
         raise FileNotFoundError(f"源存档目录不存在: {source}")
-    if not direct_save_files(source):
+    source_file = find_save_file(source, game) if game.exact_file_mode else None
+    if game.exact_file_mode and source_file is None:
+        raise ValueError(f"所选目录中没有 {game.slim_keep_file}。")
+    if not game.exact_file_mode and not direct_save_files(source):
         raise ValueError("所选目录中没有 .sav 存档文件。")
     if destination.exists() and not destination.is_dir():
         raise NotADirectoryError(f"当前存档路径不是文件夹: {destination}")
@@ -500,6 +704,16 @@ def apply_save_folder(source: Path, destination: Path, allow_locked: bool = Fals
         raise ValueError("源存档与当前存档存在包含关系，拒绝执行以避免递归覆盖。")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if game.exact_save_file is not None:
+        destination.mkdir(parents=True, exist_ok=True)
+        assert source_file is not None
+        copy_exact_save_file(
+            source_file,
+            destination / game.exact_save_file,
+            allow_locked=allow_locked,
+        )
+        return []
+
     if not destination.exists():
         shutil.copytree(source, destination)
         return []
@@ -560,11 +774,10 @@ def sync_tree_in_place(source: Path, destination: Path) -> None:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def is_game_running() -> bool:
+def is_game_running(game: GameProfile = DEFAULT_GAME) -> bool:
     if os.name != "nt":
         return False
-    executables = ("b1-Win64-Shipping.exe", "BlackMythWukong.exe")
-    for executable in executables:
+    for executable in game.process_names:
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"IMAGENAME eq {executable}", "/NH"],
@@ -769,9 +982,12 @@ class SlimProgressDialog(tk.Toplevel):
 class SaveManagerApp:
     def __init__(self) -> None:
         self.settings = load_settings()
+        self.game_settings = normalize_game_settings(self.settings)
+        self.active_game_key = initial_game_key(self.settings)
         self.runtime_backup_preference: str | None = None
         self.source_root: Path | None = None
         self.root_node: SaveNode | None = None
+        self.tree_game_key: str | None = None
         self.nodes: dict[str, SaveNode] = {}
         self.tree_items: dict[str, str] = {}
         self.item_nodes: dict[str, SaveNode] = {}
@@ -798,8 +1014,11 @@ class SaveManagerApp:
         self.root.geometry(f"{desired_width}x{desired_height}")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self.game_var = tk.StringVar(value=self.current_game.display_name)
         self.source_var = tk.StringVar()
         self.current_var = tk.StringVar()
+        self.path_hint_var = tk.StringVar()
+        self.overwrite_hint_var = tk.StringVar()
         self.status_var = tk.StringVar(value="正在初始化…")
         self.summary_var = tk.StringVar(value="请选择存档库")
         self._build_ui()
@@ -808,6 +1027,10 @@ class SaveManagerApp:
         self._suppress_settings = False
         self.root.after_idle(self._set_initial_sash)
         self.root.after(120, self._startup_scan)
+
+    @property
+    def current_game(self) -> GameProfile:
+        return GAME_PROFILES.get(self.active_game_key, DEFAULT_GAME)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -857,7 +1080,7 @@ class SaveManagerApp:
         ttk.Label(header, text=APP_NAME, style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="保留存档库目录树 · 自动定位 Steam 当前存档 · 覆盖前可选备份",
+            text="双游戏存档库 · 自动定位 Steam 当前存档 · 覆盖前可选备份",
             style="Muted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         ttk.Button(header, text="打开备份目录", command=self._open_backup_root).grid(row=0, column=1, rowspan=2, sticky="e")
@@ -866,24 +1089,36 @@ class SaveManagerApp:
         paths.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         paths.columnconfigure(1, weight=1)
 
-        ttk.Label(paths, text="存档库：").grid(row=0, column=0, sticky="w", pady=3)
-        source_entry = ttk.Entry(paths, textvariable=self.source_var)
-        source_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=3)
-        source_entry.bind("<Return>", lambda _event: self._load_source())
-        ttk.Button(paths, text="浏览…", command=self._browse_source).grid(row=0, column=2, padx=(0, 6), pady=3)
-        ttk.Button(paths, text="读取/刷新", command=self._load_source).grid(row=0, column=3, pady=3)
+        ttk.Label(paths, text="当前游戏：").grid(row=0, column=0, sticky="w", pady=3)
+        self.game_combo = ttk.Combobox(
+            paths,
+            textvariable=self.game_var,
+            values=tuple(profile.display_name for profile in GAME_PROFILES.values()),
+            state="readonly",
+            width=20,
+        )
+        self.game_combo.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=3)
+        self.game_combo.bind("<<ComboboxSelected>>", self._on_game_changed)
 
-        ttk.Label(paths, text="当前存档：").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(paths, text="存档库：").grid(row=1, column=0, sticky="w", pady=3)
+        source_entry = ttk.Entry(paths, textvariable=self.source_var)
+        source_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=3)
+        source_entry.bind("<Return>", lambda _event: self._load_source())
+        ttk.Button(paths, text="浏览…", command=self._browse_source).grid(row=1, column=2, padx=(0, 6), pady=3)
+        ttk.Button(paths, text="读取/刷新", command=self._load_source).grid(row=1, column=3, pady=3)
+
+        ttk.Label(paths, text="当前存档目录：").grid(row=2, column=0, sticky="w", pady=3)
         current_entry = ttk.Entry(paths, textvariable=self.current_var)
-        current_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=3)
+        current_entry.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=3)
         current_entry.bind("<Return>", lambda _event: self._normalize_current_path(show_message=True))
-        ttk.Button(paths, text="浏览…", command=self._browse_current).grid(row=1, column=2, padx=(0, 6), pady=3)
-        ttk.Button(paths, text="自动识别", command=self._auto_detect_current).grid(row=1, column=3, pady=3)
+        ttk.Button(paths, text="浏览…", command=self._browse_current).grid(row=2, column=2, padx=(0, 6), pady=3)
+        ttk.Button(paths, text="自动识别", command=self._auto_detect_current).grid(row=2, column=3, pady=3)
         ttk.Label(
             paths,
-            text="提示：可直接选择 Steam 的 SaveGames 文件夹，程序会自动定位实际 SteamID 存档目录。",
+            textvariable=self.path_hint_var,
             style="Muted.TLabel",
-        ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
+            wraplength=self._px(820),
+        ).grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
 
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -987,7 +1222,7 @@ class SaveManagerApp:
         status.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         status.columnconfigure(0, weight=1)
         ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(status, text="覆盖会完全替换当前存档内容", style="Muted.TLabel").grid(row=0, column=1, sticky="e")
+        ttk.Label(status, textvariable=self.overwrite_hint_var, style="Muted.TLabel").grid(row=0, column=1, sticky="e")
 
 
     def _load_initial_settings(self) -> None:
@@ -1003,17 +1238,81 @@ class SaveManagerApp:
             except tk.TclError:
                 pass
 
-        source_text = str(self.settings.get("source_directory") or "").strip()
+        self.game_var.set(self.current_game.display_name)
+        self._restore_game_paths()
+        self._update_path_hint()
+
+    def _remember_active_paths(self) -> None:
+        self.game_settings[self.active_game_key] = {
+            "source_directory": self.source_var.get().strip(),
+            "current_save_directory": self.current_var.get().strip(),
+        }
+
+    def _restore_game_paths(self) -> None:
+        config = self.game_settings.get(self.active_game_key, {})
+        source_text = str(config.get("source_directory") or "").strip()
         if source_text and Path(source_text).is_dir():
             self.source_var.set(source_text)
         elif DEFAULT_ARCHIVE_ROOT is not None and DEFAULT_ARCHIVE_ROOT.is_dir():
             self.source_var.set(str(DEFAULT_ARCHIVE_ROOT))
+        else:
+            self.source_var.set("")
 
-        current_text = str(self.settings.get("current_save_directory") or "").strip()
-        if current_text and Path(current_text).is_dir():
-            self.current_var.set(current_text)
+        current_text = str(config.get("current_save_directory") or "").strip()
+        self.current_var.set(current_text if current_text and Path(current_text).is_dir() else "")
+
+    def _update_path_hint(self) -> None:
+        if self.current_game.exact_file_mode:
+            self.path_hint_var.set(
+                f"提示：可选择影之刃零的 SaveGames、Steam 或不同 SteamID 文件夹；"
+                f"仅识别 {PBZ_SAVE_FILE}，其他文件不会显示或参与覆盖。"
+            )
+            self.overwrite_hint_var.set("覆盖仅替换 PBZSaveGame.sav，当前目录其他文件保持不变")
+        else:
+            self.path_hint_var.set(
+                "提示：可直接选择 Steam 的 SaveGames 文件夹，程序会自动定位实际 SteamID 存档目录。"
+            )
+            self.overwrite_hint_var.set("覆盖会完全替换当前存档内容（UserSetting 设置文件除外）")
+
+    def _reset_game_view(self) -> None:
+        self.source_root = None
+        self.root_node = None
+        self.tree_game_key = None
+        self.nodes = {}
+        self.tree_items = {}
+        self.item_nodes = {}
+        self.selected_node = None
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._clear_details()
+        self.summary_var.set("请选择存档库")
+        self._update_action_buttons()
+
+    def _on_game_changed(self, _event=None) -> None:
+        if self.slim_running:
+            self.game_var.set(self.current_game.display_name)
+            messagebox.showinfo("任务进行中", "存档瘦身正在后台执行，完成后再切换游戏。", parent=self.root)
+            return
+        profile = game_for_display_name(self.game_var.get())
+        if profile.key == self.active_game_key:
+            return
+
+        self._remember_active_paths()
+        self.active_game_key = profile.key
+        self.runtime_backup_preference = None
+        self._reset_game_view()
+        self._restore_game_paths()
+        self._update_path_hint()
+        self._set_status(f"已切换到《{profile.display_name}》，正在恢复该游戏配置…")
+        self._persist_settings()
+        self.root.after_idle(lambda game_key=profile.key: self._start_game_scan(game_key))
 
     def _startup_scan(self) -> None:
+        self._start_game_scan(self.active_game_key)
+
+    def _start_game_scan(self, game_key: str) -> None:
+        if game_key != self.active_game_key:
+            return
         if self.source_var.get().strip():
             self._load_source(select_saved=True)
         if not self._normalize_current_path(show_message=False):
@@ -1022,14 +1321,16 @@ class SaveManagerApp:
     def _persist_settings(self) -> None:
         if self._suppress_settings:
             return
+        self._remember_active_paths()
         data = {
             "version": SETTINGS_VERSION,
-            "source_directory": self.source_var.get().strip(),
-            "current_save_directory": self.current_var.get().strip(),
+            "game": self.active_game_key,
+            "games": self.game_settings,
             "geometry": self.root.geometry(),
             "ui_scale": self.dpi_scale,
         }
         save_settings(data)
+        self.settings = data
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
@@ -1046,12 +1347,12 @@ class SaveManagerApp:
     def _browse_current(self) -> None:
         initial = self.current_var.get().strip()
         if not initial:
-            detected_roots = discover_savegames_roots()
+            detected_roots = discover_savegames_roots(self.current_game)
             initial = str(detected_roots[0]) if detected_roots else str(Path.home())
         selected = filedialog.askdirectory(title="选择当前存档文件夹", initialdir=initial, mustexist=True)
         if not selected:
             return
-        detected = resolve_current_save_folder(selected)
+        detected = resolve_current_save_folder(selected, self.current_game)
         self.current_var.set(str(detected or selected))
         if detected and str(detected) != selected:
             self._set_status(f"已从所选目录自动定位实际存档：{detected}")
@@ -1069,7 +1370,8 @@ class SaveManagerApp:
             if show_message:
                 messagebox.showerror("路径无效", f"当前存档文件夹不存在：\n{text}", parent=self.root)
             return False
-        detected = resolve_current_save_folder(path)
+        game = self.current_game
+        detected = resolve_current_save_folder(path, game)
         if detected is None:
             if show_message:
                 messagebox.showerror("路径无效", f"无法识别当前存档目录：\n{text}", parent=self.root)
@@ -1082,22 +1384,28 @@ class SaveManagerApp:
         return True
 
     def _auto_detect_current(self, show_message: bool = True) -> None:
-        self._set_status("正在扫描 Steam 库并识别当前存档…")
+        game = self.current_game
+        self._set_status(f"正在扫描 Steam 库并识别《{game.display_name}》当前存档…")
         self.root.update_idletasks()
         self.root.configure(cursor="watch")
         try:
-            detected = auto_detect_current_save()
+            detected = auto_detect_current_save(game)
         except Exception:
             detected = None
         finally:
             self.root.configure(cursor="")
         if detected is None:
             self.current_var.set("")
-            self._set_status("未找到当前存档，请手动选择 SaveGames 或其实际存档文件夹。")
+            self._set_status(f"未找到《{game.display_name}》当前存档，请手动选择存档目录。")
+            self._persist_settings()
             if show_message:
+                if game.exact_file_mode:
+                    detail = f"请选择 SaveGames、Steam 或其中的 SteamID 文件夹，目录内需包含 {PBZ_SAVE_FILE}。"
+                else:
+                    detail = "请点击“浏览…”手动选择 SaveGames 文件夹或其中的 SteamID 文件夹。"
                 messagebox.showinfo(
                     "未自动识别",
-                    "没有找到《黑神话：悟空》的当前存档。\n\n请点击“浏览…”手动选择 SaveGames 文件夹或其中的 SteamID 文件夹。",
+                    f"没有找到《{game.display_name}》的当前存档。\n\n{detail}",
                     parent=self.root,
                 )
         else:
@@ -1117,7 +1425,12 @@ class SaveManagerApp:
             messagebox.showerror("路径无效", f"存档库文件夹不存在：\n{root}", parent=self.root)
             return
 
-        same_root = self.source_root is not None and self.source_root == root
+        game = self.current_game
+        same_root = (
+            self.tree_game_key == game.key
+            and self.source_root is not None
+            and self.source_root == root
+        )
         selected_path = self.selected_node.path if same_root and self.selected_node is not None else None
         expanded_paths = set()
         yview = self.tree.yview()
@@ -1134,7 +1447,7 @@ class SaveManagerApp:
         self._set_status("正在读取存档目录树…")
         self.root.update_idletasks()
         try:
-            root_node, nodes = scan_save_tree(root)
+            root_node, nodes = scan_save_tree(root, game)
         except Exception as error:
             self.root.configure(cursor="")
             self._set_status("读取存档库失败。")
@@ -1145,6 +1458,7 @@ class SaveManagerApp:
 
         self.source_root = root
         self.root_node = root_node
+        self.tree_game_key = game.key
         self.nodes = nodes
         self.selected_node = None
         self._populate_tree(
@@ -1161,7 +1475,12 @@ class SaveManagerApp:
         save_dirs = root_node.total_save_dirs
         self._set_status(f"已读取 {save_dirs} 套存档，共 {root_node.total_files} 个文件。")
         if save_dirs == 0:
-            self.summary_var.set("未发现 .sav 存档文件，但空文件夹和目录结构仍会保留。")
+            if game.exact_file_mode:
+                self.summary_var.set(
+                    f"未发现 {PBZ_SAVE_FILE}，但空文件夹和目录结构仍会保留。"
+                )
+            else:
+                self.summary_var.set("未发现 .sav 存档文件，但空文件夹和目录结构仍会保留。")
         self._update_action_buttons()
 
     def _nearest_tree_item(self, path: Path | None) -> str | None:
@@ -1281,10 +1600,7 @@ class SaveManagerApp:
             self.context_menu.grab_release()
 
     def _node_has_archive_save(self, node: SaveNode) -> bool:
-        for file_info in node.direct_files:
-            if file_info.name.casefold().startswith("archivesavefile"):
-                return True
-        return any(self._node_has_archive_save(child) for child in node.children)
+        return node_has_slim_source(node)
 
     def _on_tree_select(self, _event=None) -> None:
         selection = self.tree.selection()
@@ -1305,14 +1621,19 @@ class SaveManagerApp:
             self.file_tree.delete(item)
 
     def _show_node(self, node: SaveNode) -> None:
-        self.summary_var.set(
+        visible_files = node.display_files
+        ignored_count = len(node.direct_files) - len(visible_files)
+        summary = (
             f"{node.path}\n"
-            f"本目录 {len(node.direct_files)} 个文件；子树共 {node.total_files} 个文件，"
+            f"本目录 {len(visible_files)} 个可见文件；子树共 {node.total_files} 个文件，"
             f"{format_size(node.total_size)}；包含 {node.total_save_dirs} 套存档。"
         )
+        if ignored_count:
+            summary += f"\n已忽略 {ignored_count} 个非存档文件，仅显示 {node.game.slim_keep_file}。"
+        self.summary_var.set(summary)
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
-        for file_info in node.direct_files:
+        for file_info in visible_files:
             self.file_tree.insert(
                 "",
                 "end",
@@ -1321,8 +1642,11 @@ class SaveManagerApp:
             )
 
     def _update_action_buttons(self) -> None:
-        has_tree = self.root_node is not None
+        has_tree = self.root_node is not None and self.tree_game_key == self.active_game_key
         node = self.selected_node
+        node_matches_game = bool(has_tree and node is not None and node.game.key == self.active_game_key)
+        if not node_matches_game:
+            node = None
         can_save = bool(node and node.is_save_dir and node.path != self.source_root)
         can_mutate = not self.slim_running
         can_delete_folder = bool(
@@ -1360,24 +1684,32 @@ class SaveManagerApp:
             index = self.context_menu_indices.get(label)
             if index is not None:
                 self.context_menu.entryconfigure(index, state="normal" if enabled else "disabled")
+        self.game_combo.configure(state="disabled" if self.slim_running else "readonly")
 
 
     def _overwrite_current(self) -> None:
+        game = self.current_game
         source = self.selected_node
-        if source is None or not source.is_save_dir or source.path == self.source_root:
+        if (
+            source is None
+            or source.game.key != game.key
+            or not source.is_save_dir
+            or source.path == self.source_root
+        ):
             messagebox.showinfo("请选择存档", "请在左侧选择标记为“[存档]”的目录。", parent=self.root)
             return
         if not self._normalize_current_path(show_message=False):
             self._set_status("当前存档路径为空或无效，请先指定或自动识别。")
             messagebox.showwarning(
                 "需要当前存档路径",
-                "尚未识别到当前存档。\n\n请点击“自动识别”，或手动选择 SaveGames / 实际 SteamID 存档文件夹。",
+                f"尚未识别到《{game.display_name}》的当前存档。\n\n"
+                "请点击“自动识别”，或手动选择存档目录。",
                 parent=self.root,
             )
             return
 
         destination = Path(self.current_var.get())
-        game_running = is_game_running()
+        game_running = is_game_running(game)
 
         preference = self.runtime_backup_preference
         remembered = preference is not None
@@ -1402,10 +1734,10 @@ class SaveManagerApp:
             if preference == "backup":
                 self._set_status("正在备份当前存档…")
                 self.root.update_idletasks()
-                backup_path = backup_current_save(source.path, destination)
+                backup_path = backup_current_save(source.path, destination, game)
             self._set_status("正在覆盖当前存档…")
             self.root.update_idletasks()
-            warnings = apply_save_folder(source.path, destination, allow_locked=game_running)
+            warnings = apply_save_folder(source.path, destination, allow_locked=game_running, game=game)
         except Exception as error:
             self._set_status("覆盖失败，当前存档已尽量保持原状。")
             messagebox.showerror(
@@ -1423,6 +1755,8 @@ class SaveManagerApp:
         else:
             message = f"存档：{source.name}\n覆盖完成。"
             self._set_status(f"覆盖完成：{source.name} -> {destination}")
+        if game.exact_file_mode:
+            message += f"\n\n已仅更新 {game.slim_keep_file}，当前目录中的其他文件未改动。"
         if game_running:
             message += "\n\n游戏当前正在运行：请回到标题界面并重新读取存档。"
         if warnings:
@@ -1450,7 +1784,7 @@ class SaveManagerApp:
         return None
 
     def _new_folder(self) -> None:
-        if self.root_node is None or self.source_root is None:
+        if self.root_node is None or self.source_root is None or self.tree_game_key != self.active_game_key:
             return
         selected = self.selected_node or self.root_node
         if selected.is_save_dir and selected.path != self.source_root:
@@ -1488,7 +1822,12 @@ class SaveManagerApp:
 
     def _rename_node(self) -> None:
         node = self.selected_node
-        if node is None or self.source_root is None or node.path == self.source_root:
+        if (
+            node is None
+            or node.game.key != self.active_game_key
+            or self.source_root is None
+            or node.path == self.source_root
+        ):
             return
         name = simpledialog.askstring(
             "重命名文件夹/存档",
@@ -1520,7 +1859,8 @@ class SaveManagerApp:
         self._set_status(f"已重命名：{old_path.name} -> {name}")
 
     def _new_save(self) -> None:
-        if self.root_node is None or self.source_root is None:
+        game = self.current_game
+        if self.root_node is None or self.source_root is None or self.tree_game_key != game.key:
             return
         selected = self.selected_node or self.root_node
         if selected.is_save_dir and selected.path != self.source_root:
@@ -1557,7 +1897,7 @@ class SaveManagerApp:
         self._set_status(f"正在从当前存档新建：{name}")
         self.root.update_idletasks()
         try:
-            shutil.copytree(current, new_path)
+            copy_save_folder(current, new_path, game)
         except Exception as error_message:
             shutil.rmtree(new_path, ignore_errors=True)
             self._set_status("新建存档失败。")
@@ -1569,11 +1909,21 @@ class SaveManagerApp:
         self._load_source(select_saved=False)
         self._select_path(new_path)
         self._set_status(f"已新建存档：{new_path}")
-        messagebox.showinfo("新建完成", f"已从当前存档复制内容：\n{new_path}", parent=self.root)
+        if game.exact_file_mode:
+            detail = f"已从当前存档复制 {game.slim_keep_file}"
+        else:
+            detail = "已从当前存档复制内容"
+        messagebox.showinfo("新建完成", f"{detail}：\n{new_path}", parent=self.root)
 
     def _copy_save(self) -> None:
+        game = self.current_game
         source = self.selected_node
-        if source is None or not source.is_save_dir or source.path == self.source_root:
+        if (
+            source is None
+            or source.game.key != game.key
+            or not source.is_save_dir
+            or source.path == self.source_root
+        ):
             return
         parent = source.path.parent
         base_name = f"{source.name} - 副本"
@@ -1586,8 +1936,9 @@ class SaveManagerApp:
         self._set_status(f"正在复制存档：{source.name}")
         self.root.update_idletasks()
         try:
-            shutil.copytree(source.path, destination)
+            copy_save_folder(source.path, destination, game)
         except Exception as error:
+            shutil.rmtree(destination, ignore_errors=True)
             self._set_status("复制失败。")
             messagebox.showerror("复制失败", str(error), parent=self.root)
             return
@@ -1598,8 +1949,14 @@ class SaveManagerApp:
         self._set_status(f"已复制存档：{destination}")
 
     def _delete_folder(self) -> None:
+        game = self.current_game
         node = self.selected_node
-        if node is None or self.source_root is None or node.path == self.source_root:
+        if (
+            node is None
+            or node.game.key != game.key
+            or self.source_root is None
+            or node.path == self.source_root
+        ):
             return
         if node.total_save_dirs > 0:
             messagebox.showwarning(
@@ -1612,7 +1969,7 @@ class SaveManagerApp:
             "确认删除文件夹",
             f"确定删除该文件夹吗？\n\n{node.path}\n\n"
             f"子树共 {node.total_files} 个文件、{format_size(node.total_size)}，"
-            "其中不包含任何 .sav 存档。\n删除后会先移入 Windows 回收站。",
+            f"其中不包含任何{game.display_name}存档。\n删除后会先移入 Windows 回收站。",
             parent=self.root,
         )
         if not confirmed:
@@ -1636,21 +1993,33 @@ class SaveManagerApp:
         self._set_status(f"已删除文件夹：{node.path}")
 
     def _slim_selected(self) -> None:
+        game = self.current_game
         node = self.selected_node
-        if node is None or not self._node_has_archive_save(node):
-            messagebox.showinfo("没有可瘦身内容", "所选目录及其子目录中没有 ArchiveSaveFile.*.sav。", parent=self.root)
+        if node is None or node.game.key != game.key or self.tree_game_key != game.key:
             return
-        if not self._node_has_target_save(node):
+        if not node_has_slim_source(node):
+            if game.exact_file_mode:
+                message = f"所选目录及其子目录中没有 {game.slim_keep_file}。"
+            else:
+                message = "所选目录及其子目录中没有 ArchiveSaveFile.*.sav。"
+            messagebox.showinfo("没有可瘦身内容", message, parent=self.root)
+            return
+        if not node_has_slim_target(node):
             messagebox.showinfo(
                 "没有目标存档",
-                "所选目录及其子目录中没有 ArchiveSaveFile.2.sav。\n瘦身会删除其他存档，因此已取消。",
+                f"所选目录及其子目录中没有 {game.slim_keep_file}。\n"
+                "瘦身会删除其他文件，因此已取消。",
                 parent=self.root,
             )
             return
 
-        targets = self._collect_slim_targets(node)
+        targets = collect_slim_targets(node)
         if not targets:
-            messagebox.showinfo("无需瘦身", "所选目录已经只保留 ArchiveSaveFile.2.sav。", parent=self.root)
+            messagebox.showinfo(
+                "无需瘦身",
+                f"所选目录已经只保留 {game.slim_keep_file}。",
+                parent=self.root,
+            )
             return
         total_size = 0
         for target in targets:
@@ -1661,7 +2030,7 @@ class SaveManagerApp:
         confirmed = messagebox.askyesno(
             "确认存档瘦身",
             f"瘦身范围：\n{node.path}\n\n"
-            f"将保留每个目录中的 ArchiveSaveFile.2.sav。\n"
+            f"将保留每个目录中的 {game.slim_keep_file}。\n"
             f"将删除 {len(targets)} 个其他文件，约 {format_size(total_size)}。\n\n"
             "删除内容会先移入 Windows 回收站。是否继续？",
             parent=self.root,
@@ -1694,7 +2063,7 @@ class SaveManagerApp:
             target=self._slim_worker,
             args=(targets, worker_count, self.slim_queue, permanent),
             daemon=True,
-            name="bmw-slim-dispatcher",
+            name="save-manager-slim-dispatcher",
         ).start()
         self.root.after(60, self._poll_slim_queue)
 
@@ -1713,7 +2082,7 @@ class SaveManagerApp:
         errors: list[str] = []
         done = 0
         try:
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="bmw-slim") as executor:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="save-manager-slim") as executor:
                 futures = {
                     executor.submit(
                         delete_paths_permanently_in_thread if permanent else recycle_paths_in_thread,
@@ -1759,6 +2128,7 @@ class SaveManagerApp:
                     if self.slim_dialog is not None:
                         self.slim_dialog.destroy()
                         self.slim_dialog = None
+                    self._update_action_buttons()
                     messagebox.showerror("存档瘦身失败", event[1], parent=self.root)
                 elif event_type == "done":
                     finished = True
@@ -1800,24 +2170,17 @@ class SaveManagerApp:
         else:
             self._set_status(f"存档瘦身完成：{node_path}")
         self.slim_queue = None
-
-    def _node_has_target_save(self, node: SaveNode) -> bool:
-        if any(file_info.name.casefold() == "archivesavefile.2.sav" for file_info in node.direct_files):
-            return True
-        return any(self._node_has_target_save(child) for child in node.children)
-
-    def _collect_slim_targets(self, node: SaveNode) -> list[Path]:
-        targets: list[Path] = []
-        for file_info in node.direct_files:
-            if file_info.name.casefold() != "archivesavefile.2.sav":
-                targets.append(file_info.path)
-        for child in node.children:
-            targets.extend(self._collect_slim_targets(child))
-        return targets
+        self._update_action_buttons()
 
     def _delete_save(self) -> None:
+        game = self.current_game
         node = self.selected_node
-        if node is None or not node.is_save_dir or node.path == self.source_root:
+        if (
+            node is None
+            or node.game.key != game.key
+            or not node.is_save_dir
+            or node.path == self.source_root
+        ):
             return
         confirmed = messagebox.askyesno(
             "确认删除",

@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $source = Join-Path $projectRoot "src\black_myth_save_manager.py"
 $manifest = Join-Path $projectRoot "packaging\app.manifest"
+$versionInfo = Join-Path $projectRoot "packaging\version_info.txt"
 $icon = Join-Path $projectRoot "assets\logo.ico"
 $logo = Join-Path $projectRoot "assets\logo.png"
 $outputDirectory = Join-Path $projectRoot $OutputDirectory
@@ -18,6 +19,7 @@ python -m PyInstaller `
     --windowed `
     --name "BlackMythSaveManager" `
     --manifest $manifest `
+    --version-file $versionInfo `
     --icon $icon `
     --add-data "$icon;assets" `
     --add-data "$logo;assets" `
