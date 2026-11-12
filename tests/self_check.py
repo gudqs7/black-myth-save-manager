@@ -123,6 +123,16 @@ def check_pbz_rules(base: Path) -> None:
     assert (copied / "PBZSaveGame.sav").read_bytes() == b"pbz-new"
 
 
+def check_pbz_injection_helpers() -> None:
+    bridge, oodle = app.pbz_bridge_source_paths()
+    assert bridge.is_file()
+    assert oodle.is_file()
+    ok = app._parse_pbz_result("ok slots=2 injected=2 failed=0 error=", Path("bridge.log"))
+    assert ok.ok and ok.slots == 2 and ok.injected == 2 and ok.failed == 0
+    failed = app._parse_pbz_result("fail slots=2 injected=1 failed=1 error=bad", Path("bridge.log"))
+    assert not failed.ok and failed.failed == 1 and failed.message == "bad"
+
+
 def check_settings_isolation() -> None:
     legacy = {
         "version": 1,
@@ -154,6 +164,7 @@ def main() -> None:
         check_black_myth_rules(base)
         check_black_myth_detection(base)
         check_pbz_rules(base)
+        check_pbz_injection_helpers()
         check_settings_isolation()
         print("self-check passed")
     finally:

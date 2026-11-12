@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import queue
 import re
 import shutil
-import subprocess
 import sys
+import sysconfig
 import threading
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +23,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_NAME = "黑猴 / 影之刃零存档管理"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 SETTINGS_VERSION = 2
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
@@ -30,10 +32,6 @@ PBZ_GAME_KEY = "phantom_blade_zero"
 PBZ_SAVE_FILE = "PBZSaveGame.sav"
 ARCHIVE_SAVE_PREFIX = "archivesavefile"
 BMW_SLIM_KEEP_FILE = "ArchiveSaveFile.2.sav"
-STARTUPINFO = None
-if os.name == "nt":
-    STARTUPINFO = subprocess.STARTUPINFO()
-    STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
 
 @dataclass(frozen=True)
@@ -99,6 +97,16 @@ PBZ_GAME = GameProfile(
 GAME_PROFILES = {profile.key: profile for profile in (BMW_GAME, PBZ_GAME)}
 GAME_BY_DISPLAY_NAME = {profile.display_name: profile for profile in GAME_PROFILES.values()}
 DEFAULT_GAME = BMW_GAME
+
+
+@dataclass(frozen=True)
+class PBZInjectionResult:
+    ok: bool
+    message: str
+    slots: int = 0
+    injected: int = 0
+    failed: int = 0
+    log_path: Path | None = None
 
 
 def asset_path(name: str) -> Path:
@@ -775,24 +783,457 @@ def sync_tree_in_place(source: Path, destination: Path) -> None:
 
 
 def is_game_running(game: GameProfile = DEFAULT_GAME) -> bool:
-    if os.name != "nt":
+    try:
+        return find_game_process_id(game) is not None
+    except (OSError, ctypes.ArgumentError):
         return False
-    for executable in game.process_names:
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {executable}", "/NH"],
-                capture_output=True,
-                text=True,
-                errors="ignore",
-                startupinfo=STARTUPINFO,
-                timeout=5,
-                check=False,
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("th32ModuleID", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("GlblcntUsage", wintypes.DWORD),
+        ("ProccntUsage", wintypes.DWORD),
+        ("modBaseAddr", ctypes.c_void_p),
+        ("modBaseSize", wintypes.DWORD),
+        ("hModule", ctypes.c_void_p),
+        ("szModule", wintypes.WCHAR * 256),
+        ("szExePath", wintypes.WCHAR * 260),
+    ]
+
+
+_KERNEL32 = None
+
+
+def _kernel32():
+    global _KERNEL32
+    if _KERNEL32 is not None:
+        return _KERNEL32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    kernel32.Module32FirstW.restype = wintypes.BOOL
+    kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    kernel32.Module32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.VirtualAllocEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.VirtualAllocEx.restype = ctypes.c_void_p
+    kernel32.VirtualFreeEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+    kernel32.VirtualFreeEx.restype = wintypes.BOOL
+    kernel32.WriteProcessMemory.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.WriteProcessMemory.restype = wintypes.BOOL
+    kernel32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_char_p]
+    kernel32.GetProcAddress.restype = ctypes.c_void_p
+    kernel32.CreateRemoteThread.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.CreateRemoteThread.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetExitCodeThread.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeThread.restype = wintypes.BOOL
+    _KERNEL32 = kernel32
+    return kernel32
+
+
+_USER32 = None
+
+
+def _user32():
+    global _USER32
+    if _USER32 is not None:
+        return _USER32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.EnumWindows.argtypes = [
+        ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+        wintypes.LPARAM,
+    ]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    _USER32 = user32
+    return user32
+
+
+def native_root_dir() -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        return Path(bundle_root) / "native"
+    candidates = [
+        Path(__file__).resolve().parents[1] / "native",
+        Path(sysconfig.get_path("data")) / "native",
+        Path(sys.prefix) / "native",
+    ]
+    for candidate in candidates:
+        if (candidate / "pbz_bridge.dll").is_file() or (candidate / "pbz_bridge" / "pbz_bridge.dll").is_file():
+            return candidate
+    return candidates[0]
+
+
+def pbz_bridge_source_paths() -> tuple[Path, Path]:
+    native = native_root_dir()
+    bridge_candidates = [
+        native / "pbz_bridge.dll",
+        native / "pbz_bridge" / "pbz_bridge.dll",
+        native / "pbz_bridge" / "build" / "pbz_bridge.dll",
+    ]
+    oodle_candidates = [
+        native / "oo2core_9_win64.dll",
+        native / "pbz_bridge" / "oo2core_9_win64.dll",
+    ]
+    bridge = next((path for path in bridge_candidates if path.is_file()), None)
+    oodle = next((path for path in oodle_candidates if path.is_file()), None)
+    if bridge is None or oodle is None:
+        raise FileNotFoundError("缺少 PBZ 内存桥接组件（pbz_bridge.dll / oo2core_9_win64.dll）。")
+    return bridge, oodle
+
+
+def ensure_pbz_bridge_runtime() -> tuple[Path, Path]:
+    if os.name != "nt":
+        raise RuntimeError("PBZ 内存注入仅支持 Windows。")
+    bridge, oodle = pbz_bridge_source_paths()
+    digest = hashlib.sha256(bridge.read_bytes()).hexdigest()[:12]
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "BlackMythSaveManager" / "PBZBridge"
+    runtime = base / f"bridge-{digest}"
+    runtime.mkdir(parents=True, exist_ok=True)
+    bridge_target = runtime / "pbz_bridge.dll"
+    oodle_target = runtime / "oo2core_9_win64.dll"
+    for source, target in ((bridge, bridge_target), (oodle, oodle_target)):
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        target_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else ""
+        if source_hash != target_hash:
+            shutil.copy2(source, target)
+    return bridge_target, oodle_target
+
+
+def _process_has_visible_window(pid: int) -> bool:
+    user32 = _user32()
+    found = False
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(window, _parameter):
+        nonlocal found
+        window_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(window_pid))
+        if window_pid.value == pid and user32.IsWindowVisible(window):
+            found = True
+            return False
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return found
+
+
+def find_game_process_id(game: GameProfile = DEFAULT_GAME) -> int | None:
+    if os.name != "nt":
+        return None
+    kernel32 = _kernel32()
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        return None
+    matches: list[int] = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        names = {name.casefold() for name in game.process_names}
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                if entry.szExeFile.casefold() in names:
+                    matches.append(int(entry.th32ProcessID))
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    for candidate in matches:
+        if _process_has_visible_window(candidate):
+            return candidate
+    return matches[0] if matches else None
+
+
+def _remote_modules(pid: int) -> list[tuple[str, Path | None, int]]:
+    kernel32 = _kernel32()
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000008 | 0x00000010, pid)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        return []
+    modules: list[tuple[str, Path | None, int]] = []
+    try:
+        entry = MODULEENTRY32W()
+        entry.dwSize = ctypes.sizeof(MODULEENTRY32W)
+        if kernel32.Module32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                module_path = Path(str(entry.szExePath)) if str(entry.szExePath) else None
+                modules.append((str(entry.szModule), module_path, int(entry.modBaseAddr or 0)))
+                if not kernel32.Module32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return modules
+
+
+def _find_remote_module_base(pid: int, module_path: Path) -> int | None:
+    target_path = str(module_path.resolve()).casefold()
+    target_name = module_path.name.casefold()
+    for module_name, module_file, base in _remote_modules(pid):
+        same_path = module_file is not None and str(module_file.resolve()).casefold() == target_path
+        if same_path or (module_file is None and module_name.casefold() == target_name):
+            return base
+    return None
+
+
+def _remote_module_loaded(pid: int, module_name: str) -> bool:
+    target = module_name.casefold()
+    return any(name.casefold() == target for name, _path, _base in _remote_modules(pid))
+
+
+def _remote_write(process: int, data: bytes) -> int | None:
+    kernel32 = _kernel32()
+    address = kernel32.VirtualAllocEx(process, None, len(data), 0x00003000, 0x00000004)
+    if not address:
+        return None
+    written = ctypes.c_size_t()
+    buffer = ctypes.create_string_buffer(data, len(data))
+    if not kernel32.WriteProcessMemory(
+        process,
+        address,
+        ctypes.cast(buffer, ctypes.c_void_p),
+        len(data),
+        ctypes.byref(written),
+    ):
+        kernel32.VirtualFreeEx(process, address, 0, 0x00008000)
+        return None
+    return int(address)
+
+
+def _remote_call(process: int, start_address: int, parameter: int, timeout_ms: int) -> tuple[bool, int | None, str]:
+    kernel32 = _kernel32()
+    thread_id = wintypes.DWORD()
+    thread = kernel32.CreateRemoteThread(process, None, 0, start_address, parameter, 0, ctypes.byref(thread_id))
+    if not thread:
+        return False, None, f"创建远程线程失败（Windows 错误 {ctypes.get_last_error()}）"
+    try:
+        wait = kernel32.WaitForSingleObject(thread, timeout_ms)
+        if wait != 0:
+            return False, None, "等待游戏进程响应超时"
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeThread(thread, ctypes.byref(exit_code)):
+            return False, None, f"读取远程线程结果失败（Windows 错误 {ctypes.get_last_error()}）"
+        return True, int(exit_code.value), ""
+    finally:
+        kernel32.CloseHandle(thread)
+
+
+def _parse_pbz_result(text: str, log_path: Path) -> PBZInjectionResult:
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    match = re.search(
+        r"^(ok|fail) slots=(\d+) injected=(\d+) failed=(\d+) error=(.*)$",
+        line,
+    )
+    if match is None:
+        return PBZInjectionResult(False, line or "桥接返回格式无效。", log_path=log_path)
+    status, slots_text, injected_text, failed_text, error = match.groups()
+    ok = status == "ok"
+    slots = int(slots_text)
+    injected = int(injected_text)
+    failed = int(failed_text)
+    if ok:
+        message = f"已写入游戏内存：{injected}/{slots} 个槽位。"
+    else:
+        message = error or "桥接返回失败。"
+    return PBZInjectionResult(ok, message, slots, injected, failed, log_path)
+
+
+def inject_pbz_save_to_memory(
+    save_file: Path,
+    game: GameProfile = PBZ_GAME,
+    timeout_ms: int = 30000,
+) -> PBZInjectionResult:
+    if os.name != "nt":
+        return PBZInjectionResult(False, "PBZ 内存注入仅支持 Windows。")
+    pid = find_game_process_id(game)
+    if pid is None:
+        return PBZInjectionResult(False, "未找到正在运行的 PBZ.exe。")
+    try:
+        bridge_path, oodle_path = ensure_pbz_bridge_runtime()
+    except Exception as error:
+        return PBZInjectionResult(False, str(error))
+
+    job_dir = app_data_dir() / "pbz_bridge_jobs"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    job_path = job_dir / f"{token}.ini"
+    result_path = job_dir / f"{token}.result.txt"
+    log_path = job_dir / f"{token}.log.txt"
+    job_path.write_text(
+        "\n".join(
+            [
+                f"save={save_file.resolve()}",
+                f"oodle={oodle_path.resolve()}",
+                f"result={result_path.resolve()}",
+                f"log={log_path.resolve()}",
+                "delay_ms=50",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    kernel32 = _kernel32()
+    process = kernel32.OpenProcess(0x001F0FFF, False, pid)
+    if not process:
+        return PBZInjectionResult(False, f"无法打开 PBZ.exe（Windows 错误 {ctypes.get_last_error()}；如游戏以管理员运行，请同样以管理员运行本程序）。")
+
+    remote_job = None
+    remote_dll = None
+    exit_code: int | None = None
+    try:
+        remote_base = _find_remote_module_base(pid, bridge_path)
+        if remote_base is None and _remote_module_loaded(pid, bridge_path.name):
+            return PBZInjectionResult(
+                False,
+                "检测到游戏内已加载另一个版本的 PBZ 桥接。请重启游戏后再执行覆盖，避免重复 Hook。",
             )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if executable.casefold() in (result.stdout or "").casefold():
-            return True
-    return False
+        if remote_base is None:
+            load_library = kernel32.GetProcAddress(kernel32._handle, b"LoadLibraryW")
+            dll_text = str(bridge_path.resolve()).encode("utf-16-le") + b"\x00\x00"
+            remote_dll = _remote_write(process, dll_text)
+            if not remote_dll:
+                return PBZInjectionResult(False, f"无法写入远程 DLL 路径（Windows 错误 {ctypes.get_last_error()}）。")
+            ok, exit_code, error = _remote_call(process, int(load_library), remote_dll, 15000)
+            if not ok or not exit_code:
+                return PBZInjectionResult(False, error or "LoadLibraryW 注入失败。")
+            remote_base = _find_remote_module_base(pid, bridge_path)
+            if remote_base is None:
+                return PBZInjectionResult(False, "桥接 DLL 已加载，但无法定位其模块基址。")
+
+        local_library = ctypes.WinDLL(str(bridge_path))
+        local_base = int(local_library._handle)
+        local_export = ctypes.cast(local_library.PBZ_RunJobW, ctypes.c_void_p).value
+        if not local_export:
+            return PBZInjectionResult(False, "桥接 DLL 缺少 PBZ_RunJobW 导出。")
+        remote_function = remote_base + (int(local_export) - local_base)
+
+        job_text = str(job_path.resolve()).encode("utf-16-le") + b"\x00\x00"
+        remote_job = _remote_write(process, job_text)
+        if not remote_job:
+            return PBZInjectionResult(False, f"无法写入远程任务路径（Windows 错误 {ctypes.get_last_error()}）。")
+        ok, exit_code, error = _remote_call(process, remote_function, remote_job, timeout_ms)
+        if not ok:
+            return PBZInjectionResult(False, error, log_path=log_path)
+    finally:
+        if remote_job:
+            kernel32.VirtualFreeEx(process, remote_job, 0, 0x00008000)
+        if remote_dll:
+            kernel32.VirtualFreeEx(process, remote_dll, 0, 0x00008000)
+        kernel32.CloseHandle(process)
+
+    try:
+        result_text = result_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        result_text = ""
+    if not result_text:
+        return PBZInjectionResult(False, "桥接进程未返回结果。", log_path=log_path)
+    result = _parse_pbz_result(result_text, log_path)
+    if not result.ok and exit_code not in (None, 0, 1):
+        return PBZInjectionResult(
+            False,
+            f"桥接线程异常退出码 {exit_code}。",
+            result.slots,
+            result.injected,
+            result.failed,
+            log_path,
+        )
+    return result
+
+
+class PBZInjectDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, save_file: Path):
+        super().__init__(parent)
+        self.result: PBZInjectionResult | None = None
+        self._queue: queue.Queue = queue.Queue()
+        self.title("写入游戏内存")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        frame = ttk.Frame(self, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="正在把存档写入游戏内存", style="DialogTitle.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="桥接正在解密存档，并在游戏线程逐槽调用 ReplaceSaveString。请不要关闭游戏。",
+            style="Muted.TLabel",
+            wraplength=520,
+        ).pack(anchor="w", pady=(6, 12))
+        progress = ttk.Progressbar(frame, mode="indeterminate", length=480)
+        progress.pack(fill="x")
+        progress.start(12)
+        self._progress = progress
+        self.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 3)
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+        threading.Thread(target=self._worker, args=(save_file,), daemon=True).start()
+        self.after(100, self._poll)
+
+    def _worker(self, save_file: Path) -> None:
+        try:
+            self._queue.put(inject_pbz_save_to_memory(save_file))
+        except Exception as error:
+            self._queue.put(PBZInjectionResult(False, str(error)))
+
+    def _poll(self) -> None:
+        try:
+            self.result = self._queue.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll)
+            return
+        self._progress.stop()
+        self.destroy()
 
 
 class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -893,7 +1334,7 @@ class BackupPrompt(tk.Toplevel):
         if game_running:
             ttk.Label(
                 frame,
-                text="检测到游戏正在运行：允许覆盖；请先回到标题界面，覆盖后重新读取存档。",
+                text="检测到游戏正在运行：覆盖后会直接写入游戏内存；建议先回到标题界面。",
                 style="Warning.TLabel",
                 wraplength=520,
             ).pack(anchor="w", pady=(0, 14))
@@ -1267,7 +1708,7 @@ class SaveManagerApp:
                 f"提示：可选择影之刃零的 SaveGames、Steam 或不同 SteamID 文件夹；"
                 f"仅识别 {PBZ_SAVE_FILE}，其他文件不会显示或参与覆盖。"
             )
-            self.overwrite_hint_var.set("覆盖仅替换 PBZSaveGame.sav，当前目录其他文件保持不变")
+            self.overwrite_hint_var.set("覆盖仅替换 PBZSaveGame.sav；游戏运行时自动写入内存")
         else:
             self.path_hint_var.set(
                 "提示：可直接选择 Steam 的 SaveGames 文件夹，程序会自动定位实际 SteamID 存档目录。"
@@ -1749,18 +2190,52 @@ class SaveManagerApp:
         finally:
             self.root.configure(cursor="")
 
+        inject_result: PBZInjectionResult | None = None
+        if game.exact_file_mode and game_running:
+            self._set_status("正在将新存档写入游戏内存…")
+            self.root.update_idletasks()
+            inject_dialog = PBZInjectDialog(self.root, source.path / game.slim_keep_file)
+            self.root.wait_window(inject_dialog)
+            inject_result = inject_dialog.result or PBZInjectionResult(False, "写入游戏内存未返回结果。")
+            if inject_result.ok:
+                self._set_status(
+                    f"覆盖并写入内存完成：{source.name}，"
+                    f"{inject_result.injected}/{inject_result.slots} 个槽位"
+                )
+            else:
+                self._set_status("磁盘存档已覆盖，但写入游戏内存失败。")
+
         if backup_path is not None:
             message = f"存档：{source.name}\n覆盖完成，原当前存档已备份到：\n{backup_path}"
-            self._set_status(f"覆盖完成：{source.name}，已备份到 {backup_path}")
+            if inject_result is None or inject_result.ok:
+                self._set_status(f"覆盖完成：{source.name}，已备份到 {backup_path}")
         else:
             message = f"存档：{source.name}\n覆盖完成。"
-            self._set_status(f"覆盖完成：{source.name} -> {destination}")
+            if inject_result is None or inject_result.ok:
+                self._set_status(f"覆盖完成：{source.name} -> {destination}")
         if game.exact_file_mode:
             message += f"\n\n已仅更新 {game.slim_keep_file}，当前目录中的其他文件未改动。"
-        if game_running:
+        if game_running and game.exact_file_mode and inject_result is not None:
+            if inject_result.ok:
+                message += (
+                    f"\n\n已直接写入游戏内存：{inject_result.injected}/{inject_result.slots} 个槽位。"
+                    "\n请回到标题界面，继续/读取会立即显示新存档。"
+                )
+            else:
+                message += (
+                    f"\n\n磁盘存档已覆盖，但写入游戏内存失败：\n{inject_result.message}"
+                    "\n\n请重启游戏，或进入标题界面后重新覆盖一次。"
+                )
+                if inject_result.log_path is not None:
+                    message += f"\n\n桥接日志：\n{inject_result.log_path}"
+        elif game_running:
             message += "\n\n游戏当前正在运行：请回到标题界面并重新读取存档。"
         if warnings:
             message += "\n\n以下旧文件未能清理（通常正在被游戏占用）：\n" + "\n".join(warnings[:8])
+        injection_failed = bool(
+            game_running and game.exact_file_mode and inject_result is not None and not inject_result.ok
+        )
+        if warnings or injection_failed:
             messagebox.showwarning("操作完成", message, parent=self.root)
         elif not remembered:
             messagebox.showinfo("操作完成", message, parent=self.root)

@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 6, 0, 0),
-    prodvers=(1, 6, 0, 0),
+    filevers=(1, 7, 0, 0),
+    prodvers=(1, 7, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'gudqs7'),
           StringStruct('FileDescription', '黑猴 / 影之刃零存档管理'),
-          StringStruct('FileVersion', '1.6.0.0'),
+          StringStruct('FileVersion', '1.7.0.0'),
           StringStruct('InternalName', 'BlackMythSaveManager'),
           StringStruct('OriginalFilename', 'BlackMythSaveManager.exe'),
           StringStruct('ProductName', '黑猴 / 影之刃零存档管理'),
-          StringStruct('ProductVersion', '1.6.0.0')
+          StringStruct('ProductVersion', '1.7.0.0')
         ]
       )
     ]),
