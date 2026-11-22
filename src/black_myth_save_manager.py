@@ -7,24 +7,29 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import sysconfig
+import tempfile
 import threading
 import traceback
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import trainer_core
 
-APP_NAME = "黑猴 / 影之刃零存档管理"
-APP_VERSION = "1.7.0"
-SETTINGS_VERSION = 2
+
+APP_NAME = "黑猴 / 影之刃零存档、Mod 与修改器管理"
+APP_VERSION = "1.9.3"
+SETTINGS_VERSION = 4
 DEFAULT_ARCHIVE_ROOT: Path | None = None
 USER_SETTING_SAVE = "UserSettingSaveGame.sav"
 BMW_GAME_KEY = "black_myth_wukong"
@@ -32,6 +37,18 @@ PBZ_GAME_KEY = "phantom_blade_zero"
 PBZ_SAVE_FILE = "PBZSaveGame.sav"
 ARCHIVE_SAVE_PREFIX = "archivesavefile"
 BMW_SLIM_KEEP_FILE = "ArchiveSaveFile.2.sav"
+MOD_SETTINGS_VERSION = 1
+MOD_INSTALLATIONS_VERSION = 1
+MOD_DEFAULT_LIBRARY_ROOT = Path(r"G:\games\mod")
+MOD_LIBRARY_FOLDER_NAMES = {
+    BMW_GAME_KEY: "黑猴",
+    PBZ_GAME_KEY: "影之刃",
+}
+MOD_PAK_SUFFIXES = {".pak", ".utoc", ".ucas", ".sig"}
+MOD_ZIP_SUFFIXES = {".zip"}
+MOD_UNSUPPORTED_ARCHIVE_SUFFIXES = {".7z", ".rar"}
+COLUMN_WIDTH_MIN = 40
+COLUMN_WIDTH_MAX = 4000
 
 
 @dataclass(frozen=True)
@@ -42,6 +59,7 @@ class GameProfile:
     save_relative_paths: tuple[tuple[str, ...], ...]
     process_names: tuple[str, ...]
     exact_save_file: str | None = None
+    steam_app_id: str | None = None
 
     @property
     def exact_file_mode(self) -> bool:
@@ -82,6 +100,7 @@ BMW_GAME = GameProfile(
         ("b1", "Saved", "SaveGames", "SaveGames"),
     ),
     process_names=("b1-Win64-Shipping.exe", "BlackMythWukong.exe"),
+    steam_app_id="2358720",
 )
 PBZ_GAME = GameProfile(
     key=PBZ_GAME_KEY,
@@ -93,6 +112,7 @@ PBZ_GAME = GameProfile(
     ),
     process_names=("PBZ.exe", "ProjectPBZ-Win64-Shipping.exe", "PBZ-Win64-Shipping.exe"),
     exact_save_file=PBZ_SAVE_FILE,
+    steam_app_id="4115450",
 )
 GAME_PROFILES = {profile.key: profile for profile in (BMW_GAME, PBZ_GAME)}
 GAME_BY_DISPLAY_NAME = {profile.display_name: profile for profile in GAME_PROFILES.values()}
@@ -107,6 +127,113 @@ class PBZInjectionResult:
     injected: int = 0
     failed: int = 0
     log_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class ModPayloadFile:
+    source_name: str
+    target_relative: str
+    size: int
+
+
+@dataclass(frozen=True)
+class ModDescriptor:
+    source: Path
+    game_key: str
+    name: str
+    container_kind: str
+    mod_type: str
+    type_label: str
+    target_root: str
+    total_size: int
+    files: tuple[ModPayloadFile, ...]
+    warnings: tuple[str, ...] = ()
+    error: str = ""
+
+    @property
+    def installable(self) -> bool:
+        return bool(self.files) and not self.error and self.mod_type != "unknown"
+
+
+@dataclass
+class ModInstallation:
+    id: str
+    game_key: str
+    source: str
+    name: str
+    mod_type: str
+    type_label: str
+    game_directory: str
+    installed_at: str
+    files: list[str]
+    directories: list[str]
+    backups: dict[str, str]
+    status: str = "installed"
+    last_error: str = ""
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "ModInstallation | None":
+        if not isinstance(raw, dict):
+            return None
+        try:
+            installation_id = str(raw.get("id") or "").strip()
+            game_key = str(raw.get("game_key") or "").strip()
+            source = str(raw.get("source") or "").strip()
+            game_directory = str(raw.get("game_directory") or "").strip()
+            if not installation_id or game_key not in GAME_PROFILES or not source or not game_directory:
+                return None
+            files = [str(item).replace("\\", "/") for item in raw.get("files", []) if str(item).strip()]
+            directories = [
+                str(item).replace("\\", "/") for item in raw.get("directories", []) if str(item).strip()
+            ]
+            raw_backups = raw.get("backups", {})
+            backups = {
+                str(key).replace("\\", "/"): str(value)
+                for key, value in raw_backups.items()
+                if str(key).strip() and str(value).strip()
+            } if isinstance(raw_backups, dict) else {}
+            return cls(
+                id=installation_id,
+                game_key=game_key,
+                source=source,
+                name=str(raw.get("name") or Path(source).stem),
+                mod_type=str(raw.get("mod_type") or "unknown"),
+                type_label=str(raw.get("type_label") or "未知"),
+                game_directory=game_directory,
+                installed_at=str(raw.get("installed_at") or ""),
+                files=files,
+                directories=directories,
+                backups=backups,
+                status=str(raw.get("status") or "installed"),
+                last_error=str(raw.get("last_error") or ""),
+            )
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "game_key": self.game_key,
+            "source": self.source,
+            "name": self.name,
+            "mod_type": self.mod_type,
+            "type_label": self.type_label,
+            "game_directory": self.game_directory,
+            "installed_at": self.installed_at,
+            "files": list(self.files),
+            "directories": list(self.directories),
+            "backups": dict(self.backups),
+            "status": self.status,
+            "last_error": self.last_error,
+        }
+
+
+@dataclass
+class ModOperationResult:
+    ok: bool
+    message: str
+    errors: list[str] = field(default_factory=list)
+    installation: ModInstallation | None = None
 
 
 def asset_path(name: str) -> Path:
@@ -181,6 +308,50 @@ def normalize_game_settings(settings: dict) -> dict[str, dict[str, str]]:
 
     for game_key in GAME_PROFILES:
         result.setdefault(game_key, {"source_directory": "", "current_save_directory": ""})
+    return result
+
+
+def default_mod_library_dir(game_key: str) -> Path:
+    folder_name = MOD_LIBRARY_FOLDER_NAMES.get(game_key, game_key)
+    return MOD_DEFAULT_LIBRARY_ROOT / folder_name
+
+
+def normalize_mod_settings(settings: dict) -> dict[str, dict[str, str]]:
+    result: dict[str, dict[str, str]] = {}
+    raw_mods = settings.get("mods")
+    if not isinstance(raw_mods, dict):
+        raw_mods = {}
+    for game_key in GAME_PROFILES:
+        raw_value = raw_mods.get(game_key)
+        config = raw_value if isinstance(raw_value, dict) else {}
+        library_directory = str(config.get("library_directory") or "").strip()
+        game_directory = str(config.get("game_directory") or "").strip()
+        result[game_key] = {
+            "library_directory": library_directory or str(default_mod_library_dir(game_key)),
+            "game_directory": game_directory,
+        }
+    return result
+
+
+def normalize_column_widths(raw: object) -> dict[str, dict[str, int]]:
+    result: dict[str, dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return result
+    for table_key, raw_columns in raw.items():
+        if not isinstance(table_key, str) or not table_key.strip() or not isinstance(raw_columns, dict):
+            continue
+        columns: dict[str, int] = {}
+        for column, raw_width in raw_columns.items():
+            if not isinstance(column, str) or not column.strip():
+                continue
+            try:
+                width = int(round(float(raw_width)))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if COLUMN_WIDTH_MIN <= width <= COLUMN_WIDTH_MAX:
+                columns[column] = width
+        if columns:
+            result[table_key] = columns
     return result
 
 
@@ -297,6 +468,89 @@ def discover_steam_libraries() -> set[Path]:
             }
         )
     return {path for path in libraries if path.exists()}
+
+
+def parse_steam_appmanifest(path: Path) -> tuple[str, str] | None:
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    app_id_match = re.search(r'"appid"\s+"(\d+)"', text, flags=re.IGNORECASE)
+    install_dir_match = re.search(r'"installdir"\s+"([^"]+)"', text, flags=re.IGNORECASE)
+    if app_id_match is None or install_dir_match is None:
+        return None
+    return app_id_match.group(1), install_dir_match.group(1).replace("\\\\", "\\")
+
+
+def steamapps_directories(libraries: set[Path] | None = None) -> set[Path]:
+    result: set[Path] = set()
+    for library in libraries if libraries is not None else discover_steam_libraries():
+        if library.name.casefold() == "steamapps":
+            result.add(library)
+        elif (library / "steamapps").is_dir():
+            result.add(library / "steamapps")
+        elif library.is_dir():
+            result.add(library)
+    return result
+
+
+def find_game_steam_app_id(
+    game: GameProfile,
+    steamapps_paths: set[Path] | None = None,
+) -> str | None:
+    for steamapps in sorted(steamapps_directories(steamapps_paths), key=lambda path: str(path).casefold()):
+        for manifest in sorted(steamapps.glob("appmanifest_*.acf"), key=lambda path: path.name.casefold()):
+            metadata = parse_steam_appmanifest(manifest)
+            if metadata is None:
+                continue
+            app_id, install_dir = metadata
+            if install_dir.casefold() == game.steam_install_dir.casefold():
+                return app_id
+    return game.steam_app_id
+
+
+def find_steam_executable() -> Path | None:
+    candidates = set(registry_steam_paths())
+    candidates.update(
+        {
+            Path(r"C:\Program Files (x86)\Steam"),
+            Path(r"C:\Program Files\Steam"),
+        }
+    )
+    for root in sorted(candidates, key=lambda path: str(path).casefold()):
+        executable = root / "steam.exe"
+        if executable.is_file():
+            return executable
+    return None
+
+
+def launch_game_from_steam(game: GameProfile) -> tuple[bool, str]:
+    app_id = find_game_steam_app_id(game)
+    if app_id is None:
+        return False, f"未找到《{game.display_name}》对应的 Steam AppID。"
+
+    launch_uri = f"steam://rungameid/{app_id}"
+    protocol_error: OSError | None = None
+    try:
+        os.startfile(launch_uri)
+        return True, f"已请求 Steam 启动《{game.display_name}》（AppID {app_id}）。"
+    except OSError as error:
+        protocol_error = error
+
+    steam_executable = find_steam_executable()
+    if steam_executable is None:
+        return False, f"无法调用 Steam 启动游戏：{protocol_error}"
+    try:
+        subprocess.Popen(
+            [str(steam_executable), "-applaunch", app_id],
+            cwd=str(steam_executable.parent),
+            close_fds=True,
+        )
+    except OSError as error:
+        return False, f"无法通过 Steam 启动游戏：{error}"
+    return True, f"已请求 Steam 启动《{game.display_name}》（AppID {app_id}）。"
 
 
 def discover_savegames_roots(game: GameProfile = DEFAULT_GAME) -> list[Path]:
@@ -436,6 +690,911 @@ def auto_detect_current_save(game: GameProfile = DEFAULT_GAME) -> Path | None:
             if len(children) == 1:
                 return children[0]
     return None
+
+
+def is_valid_game_directory(game: GameProfile, path: Path | str | None) -> bool:
+    if path is None:
+        return False
+    folder = Path(str(path).strip().strip('"'))
+    if not folder.is_dir():
+        return False
+    if game.key == BMW_GAME_KEY:
+        return (folder / "b1" / "Binaries" / "Win64").is_dir() or (
+            folder / "b1" / "Content" / "Paks"
+        ).is_dir()
+    if game.key == PBZ_GAME_KEY:
+        return (folder / "ProjectPBZ").is_dir() and (folder / "platform" / "steam").is_dir()
+    return False
+
+
+def detect_game_install_dir(game: GameProfile = DEFAULT_GAME) -> Path | None:
+    for save_root in discover_savegames_roots(game):
+        candidate = save_root
+        while candidate.parent != candidate:
+            if candidate.name.casefold() == game.steam_install_dir.casefold() and is_valid_game_directory(game, candidate):
+                return candidate
+            candidate = candidate.parent
+
+    candidates: set[Path] = set()
+    for library in discover_steam_libraries():
+        candidates.add(library / "common" / game.steam_install_dir)
+        candidates.add(library.parent / "common" / game.steam_install_dir)
+    candidates.add(Path(r"E:\SteamLibrary\steamapps\common") / game.steam_install_dir)
+    candidates.add(Path(r"C:\Program Files (x86)\Steam\steamapps\common") / game.steam_install_dir)
+    for candidate in sorted(candidates, key=lambda item: str(item).casefold()):
+        if is_valid_game_directory(game, candidate):
+            return candidate
+    return None
+
+
+def mod_installations_file() -> Path:
+    return app_data_dir() / "mod_installations.json"
+
+
+def _mod_backup_root_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    path = Path(base) / "BlackMythSaveManager" / "ModBackups"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def load_mod_installations(path: Path | str | None = None) -> list[ModInstallation]:
+    target = Path(path) if path is not None else mod_installations_file()
+    if not target.is_file():
+        return []
+    try:
+        with target.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    raw_items = data.get("installations", []) if isinstance(data, dict) else []
+    if not isinstance(raw_items, list):
+        return []
+    result: list[ModInstallation] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        installation = ModInstallation.from_dict(raw)
+        if installation is None or installation.id in seen:
+            continue
+        seen.add(installation.id)
+        result.append(installation)
+    return result
+
+
+def save_mod_installations(installations: list[ModInstallation], path: Path | str | None = None) -> None:
+    target = Path(path) if path is not None else mod_installations_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    data = {
+        "version": MOD_INSTALLATIONS_VERSION,
+        "installations": [item.to_dict() for item in installations],
+    }
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _normalize_mod_entry_name(name: str) -> str:
+    text = name.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _entry_parts(name: str) -> tuple[str, ...] | None:
+    normalized = _normalize_mod_entry_name(name)
+    path = PurePosixPath(normalized)
+    parts = path.parts
+    if (
+        not parts
+        or path.is_absolute()
+        or path.drive
+        or any(part in ("", ".", "..") or ":" in part for part in parts)
+    ):
+        return None
+    return parts
+
+
+def _find_parts(parts: tuple[str, ...], sequence: tuple[str, ...]) -> int:
+    folded = tuple(part.casefold() for part in parts)
+    wanted = tuple(part.casefold() for part in sequence)
+    limit = len(folded) - len(wanted) + 1
+    for index in range(max(0, limit)):
+        if folded[index:index + len(wanted)] == wanted:
+            return index
+    return -1
+
+
+def _common_target_root(targets: list[str]) -> str:
+    if not targets:
+        return ""
+    paths = [PurePosixPath(target).parts for target in targets]
+    common = list(paths[0])
+    for parts in paths[1:]:
+        limit = min(len(common), len(parts))
+        index = 0
+        while index < limit and common[index].casefold() == parts[index].casefold():
+            index += 1
+        common = common[:index]
+    if len(paths) == 1 and common == list(paths[0]):
+        common = common[:-1]
+    return PurePosixPath(*common).as_posix() if common else ""
+
+
+def _map_with_prefix(name: str, index: int, prefix: tuple[str, ...] = ()) -> str | None:
+    parts = _entry_parts(name)
+    if parts is None or index < 0 or index >= len(parts):
+        return None
+    target = PurePosixPath(*(prefix + parts[index:]))
+    return target.as_posix()
+
+
+def _detect_wrapped_ue4ss_mod(
+    files: list[tuple[str, int]],
+    mods_prefix: tuple[str, ...],
+    fallback_name: str,
+) -> list[tuple[str, str, int]]:
+    wrappers: set[str] = set()
+    direct_layout = False
+    for name, _size in files:
+        parts = _entry_parts(name)
+        if parts is None:
+            continue
+        basenames = {part.casefold() for part in parts}
+        looks_like_ue4ss = "scripts" in basenames and (
+            "main.lua" in basenames or "main.dll" in basenames
+        )
+        if not looks_like_ue4ss:
+            continue
+        if len(parts) >= 2 and parts[1].casefold() == "scripts":
+            wrappers.add(parts[0])
+        elif parts[0].casefold() == "scripts":
+            direct_layout = True
+
+    if not wrappers and not direct_layout:
+        return []
+    payload: list[tuple[str, str, int]] = []
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None:
+            continue
+        if wrappers:
+            if parts[0] not in wrappers:
+                continue
+            target = (PurePosixPath(*mods_prefix) / PurePosixPath(*parts)).as_posix()
+        else:
+            target = (PurePosixPath(*mods_prefix) / fallback_name / PurePosixPath(*parts)).as_posix()
+        payload.append((name, target, size))
+    return payload
+
+
+def _map_bmw_game_payload(name: str) -> str | None:
+    parts = _entry_parts(name)
+    if parts is None:
+        return None
+    b1_index = _find_parts(parts, ("b1",))
+    binaries_index = _find_parts(parts, ("binaries", "win64"))
+    loader_index = _find_parts(parts, ("csharploader",))
+    content_index = _find_parts(parts, ("content",))
+    if b1_index >= 0:
+        return _map_with_prefix(name, b1_index)
+    if binaries_index >= 0:
+        return _map_with_prefix(name, binaries_index, ("b1",))
+    if loader_index >= 0:
+        return _map_with_prefix(name, loader_index, ("b1", "Binaries", "Win64"))
+    if content_index >= 0:
+        return _map_with_prefix(name, content_index, ("b1",))
+    basename = parts[-1].casefold()
+    if basename in {"version.dll", "hid.dll", "dwmapi.dll"}:
+        return (PurePosixPath("b1") / "Binaries" / "Win64" / parts[-1]).as_posix()
+    return None
+
+
+def _detect_bmw_mod_type(
+    files: list[tuple[str, int]],
+    fallback_name: str = "UnknownMod",
+) -> tuple[str, str, list[tuple[str, str, int]], list[str]]:
+    csharp_payload: list[tuple[str, str, int]] = []
+    csharp_targets: set[str] = set()
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None or _find_parts(parts, ("csharploader",)) < 0:
+            continue
+        target = _map_bmw_game_payload(name)
+        if target and target not in csharp_targets:
+            csharp_payload.append((name, target, size))
+            csharp_targets.add(target)
+    if csharp_payload:
+        targets = [target for _name, target, _size in csharp_payload]
+        target_names = {PurePosixPath(target).name.casefold() for target in targets}
+        has_loader_core = bool(target_names & {"csharpmanager.bin", "csharpmodbase.dll", "harmony.dll"})
+        if has_loader_core:
+            # Loader distributions also contain sibling proxy DLLs such as version.dll/hid.dll.
+            # Treat every game-file entry in that archive as part of the loader bundle so the
+            # proxy and any additional helper files are installed together with CSharpLoader.
+            for name, size in files:
+                target = _map_bmw_game_payload(name)
+                if not target or target in csharp_targets:
+                    continue
+                csharp_payload.append((name, target, size))
+                csharp_targets.add(target)
+            targets = [target for _name, target, _size in csharp_payload]
+            target_names = {PurePosixPath(target).name.casefold() for target in targets}
+        has_loader_dll = any(
+            target.casefold().endswith("/binaries/win64/version.dll")
+            or target.casefold().endswith("/binaries/win64/hid.dll")
+            or target.casefold().endswith("/binaries/win64/dwmapi.dll")
+            for target in targets
+        )
+        has_mod_payload = any(
+            "mods" in [part.casefold() for part in PurePosixPath(target).parts[:-1]]
+            and len(PurePosixPath(target).parts) > 2
+            for target in targets
+        )
+        if has_loader_core or has_loader_dll:
+            label = "C# 加载器 / 整合包" if has_mod_payload else "C# 加载器"
+            mod_type = "csharp_loader"
+        else:
+            label = "C# Mod"
+            mod_type = "csharp_mod"
+        warnings = ["检测到 CSharpLoader 本体，安装时会覆盖加载器文件。"] if has_loader_core or has_loader_dll else []
+        return mod_type, label, csharp_payload, warnings
+
+    ue4ss_payload: list[tuple[str, str, int]] = []
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None:
+            continue
+        b1_index = _find_parts(parts, ("b1",))
+        ue4ss_index = _find_parts(parts, ("ue4ss",))
+        mods_index = _find_parts(parts, ("mods",))
+        if ue4ss_index >= 0:
+            if b1_index >= 0:
+                target = _map_with_prefix(name, b1_index)
+            else:
+                target = _map_with_prefix(name, ue4ss_index, ("b1", "Binaries", "Win64"))
+        elif mods_index == 0:
+            target = _map_with_prefix(name, mods_index, ("b1", "Binaries", "Win64", "ue4ss"))
+        else:
+            target = None
+        if target:
+            ue4ss_payload.append((name, target, size))
+    if ue4ss_payload:
+        targets = [target for _name, target, _size in ue4ss_payload]
+        has_core = any(PurePosixPath(target).name.casefold() in {"ue4ss.dll", "dwmapi.dll"} for target in targets)
+        has_mod = any("mods" in [part.casefold() for part in PurePosixPath(target).parts] for target in targets)
+        if has_core and has_mod:
+            label = "UE4SS 本体 + Mod"
+        elif has_core:
+            label = "UE4SS 本体"
+        else:
+            label = "UE4SS Mod"
+        return "ue4ss_core" if has_core else "ue4ss_mod", label, ue4ss_payload, []
+
+    wrapped_ue4ss = _detect_wrapped_ue4ss_mod(
+        files,
+        ("b1", "Binaries", "Win64", "ue4ss", "Mods"),
+        fallback_name,
+    )
+    if wrapped_ue4ss:
+        return "ue4ss_mod", "UE4SS Mod", wrapped_ue4ss, []
+
+    pak_payload: list[tuple[str, str, int]] = []
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None or PurePosixPath(name).suffix.casefold() not in MOD_PAK_SUFFIXES:
+            continue
+        b1_index = _find_parts(parts, ("b1",))
+        paks_index = _find_parts(parts, ("content", "paks"))
+        if b1_index >= 0 and paks_index > b1_index:
+            target = _map_with_prefix(name, b1_index)
+        elif paks_index >= 0:
+            target = _map_with_prefix(name, paks_index, ("b1",))
+        else:
+            target = (PurePosixPath("b1") / "Content" / "Paks" / "~mods" / parts[-1]).as_posix()
+        pak_payload.append((name, target, size))
+    if pak_payload:
+        targets = [target for _name, target, _size in pak_payload]
+        is_logic = any("logicmods" in [part.casefold() for part in PurePosixPath(target).parts] for target in targets)
+        return ("logic_mod" if is_logic else "pak_mod"), ("Logic Mod" if is_logic else "Pak Mod"), pak_payload, []
+
+    generic_payload: list[tuple[str, str, int]] = []
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None:
+            continue
+        b1_index = _find_parts(parts, ("b1",))
+        binaries_index = _find_parts(parts, ("binaries", "win64"))
+        content_index = _find_parts(parts, ("content",))
+        if b1_index >= 0:
+            target = _map_with_prefix(name, b1_index)
+        elif binaries_index >= 0:
+            target = _map_with_prefix(name, binaries_index, ("b1",))
+        elif content_index >= 0:
+            target = _map_with_prefix(name, content_index, ("b1",))
+        else:
+            target = None
+        if target:
+            generic_payload.append((name, target, size))
+    if generic_payload:
+        return "game_files", "游戏文件", generic_payload, ["未匹配已知 Mod 类型，将按游戏目录结构安装。"]
+    return "unknown", "未识别", [], []
+
+
+def _detect_pbz_mod_type(
+    files: list[tuple[str, int]],
+    fallback_name: str = "UnknownMod",
+) -> tuple[str, str, list[tuple[str, str, int]], list[str]]:
+    ue4ss_payload: list[tuple[str, str, int]] = []
+    has_ue4ss_anywhere = any(
+        (parts := _entry_parts(name)) is not None and _find_parts(parts, ("ue4ss",)) >= 0
+        for name, _size in files
+    )
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None:
+            continue
+        ue4ss_index = _find_parts(parts, ("ue4ss",))
+        mods_index = _find_parts(parts, ("mods",))
+        basename = parts[-1].casefold()
+        if ue4ss_index >= 0:
+            target = _map_with_prefix(name, ue4ss_index, ("platform", "steam"))
+        elif mods_index >= 0 and mods_index + 1 < len(parts):
+            target = _map_with_prefix(name, mods_index, ("platform", "steam", "ue4ss"))
+        elif has_ue4ss_anywhere and basename in {"dwmapi.dll", "version.dll"}:
+            target = (PurePosixPath("platform") / "steam" / parts[-1]).as_posix()
+        else:
+            target = None
+        if target:
+            ue4ss_payload.append((name, target, size))
+    if ue4ss_payload:
+        targets = [target for _name, target, _size in ue4ss_payload]
+        has_core = any(PurePosixPath(target).name.casefold() == "ue4ss.dll" for target in targets)
+        has_mod = any("mods" in [part.casefold() for part in PurePosixPath(target).parts] for target in targets)
+        if has_core and has_mod:
+            label = "UE4SS 本体 + Mod"
+        elif has_core:
+            label = "UE4SS 本体"
+        else:
+            label = "UE4SS Mod"
+        return "ue4ss_core" if has_core else "ue4ss_mod", label, ue4ss_payload, []
+
+    wrapped_ue4ss = _detect_wrapped_ue4ss_mod(
+        files,
+        ("platform", "steam", "ue4ss", "Mods"),
+        fallback_name,
+    )
+    if wrapped_ue4ss:
+        return "ue4ss_mod", "UE4SS Mod", wrapped_ue4ss, []
+
+    pak_payload: list[tuple[str, str, int]] = []
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None or PurePosixPath(name).suffix.casefold() not in MOD_PAK_SUFFIXES:
+            continue
+        project_index = _find_parts(parts, ("projectpbz",))
+        paks_index = _find_parts(parts, ("content", "paks"))
+        if project_index >= 0 and paks_index > project_index:
+            target = _map_with_prefix(name, project_index)
+        elif paks_index >= 0:
+            target = _map_with_prefix(name, paks_index, ("ProjectPBZ",))
+        else:
+            target = (PurePosixPath("ProjectPBZ") / "Content" / "Paks" / "~mods" / parts[-1]).as_posix()
+        pak_payload.append((name, target, size))
+    if pak_payload:
+        targets = [target for _name, target, _size in pak_payload]
+        is_logic = any("logicmods" in [part.casefold() for part in PurePosixPath(target).parts] for target in targets)
+        return ("logic_mod" if is_logic else "pak_mod"), ("Logic Mod" if is_logic else "Pak Mod"), pak_payload, []
+
+    generic_payload: list[tuple[str, str, int]] = []
+    for name, size in files:
+        parts = _entry_parts(name)
+        if parts is None:
+            continue
+        platform_index = _find_parts(parts, ("platform", "steam"))
+        project_index = _find_parts(parts, ("projectpbz",))
+        if platform_index >= 0:
+            target = _map_with_prefix(name, platform_index)
+        elif project_index >= 0:
+            target = _map_with_prefix(name, project_index)
+        else:
+            target = None
+        if target:
+            generic_payload.append((name, target, size))
+    if generic_payload:
+        return "game_files", "游戏文件", generic_payload, ["未匹配已知 Mod 类型，将按游戏目录结构安装。"]
+    return "unknown", "未识别", [], []
+
+
+def _build_mod_descriptor(
+    source: Path,
+    game: GameProfile,
+    container_kind: str,
+    files: list[tuple[str, int]],
+    warnings: list[str] | None = None,
+) -> ModDescriptor:
+    valid_files: list[tuple[str, int]] = []
+    seen_names: set[str] = set()
+    extra_warnings = list(warnings or [])
+    for name, size in files:
+        normalized = _normalize_mod_entry_name(name)
+        if _entry_parts(normalized) is None:
+            extra_warnings.append(f"已忽略不安全的压缩包路径：{name}")
+            continue
+        if normalized in seen_names:
+            extra_warnings.append(f"压缩包包含重复文件，后出现的条目会被忽略：{normalized}")
+            continue
+        seen_names.add(normalized)
+        valid_files.append((normalized, size))
+
+    if game.key == BMW_GAME_KEY:
+        mod_type, type_label, payload, detection_warnings = _detect_bmw_mod_type(valid_files, source.stem)
+    elif game.key == PBZ_GAME_KEY:
+        mod_type, type_label, payload, detection_warnings = _detect_pbz_mod_type(valid_files, source.stem)
+    else:
+        mod_type, type_label, payload, detection_warnings = "unknown", "未识别", [], []
+
+    payload_files = tuple(
+        ModPayloadFile(source_name=name, target_relative=target, size=size)
+        for name, target, size in payload
+    )
+    target_root = _common_target_root([item.target_relative for item in payload_files])
+    error = ""
+    if not payload_files:
+        error = "无法从包内结构识别安装位置。请确认压缩包未多套一层未知目录，或解压后使用文件夹模式。"
+    return ModDescriptor(
+        source=source,
+        game_key=game.key,
+        name=source.stem if source.is_file() else source.name,
+        container_kind=container_kind,
+        mod_type=mod_type,
+        type_label=type_label,
+        target_root=target_root,
+        total_size=sum(item.size for item in payload_files),
+        files=payload_files,
+        warnings=tuple(extra_warnings + detection_warnings),
+        error=error,
+    )
+
+
+def scan_mod_source(source: Path | str, game: GameProfile = DEFAULT_GAME) -> ModDescriptor:
+    source = Path(source)
+    if source.is_dir():
+        files: list[tuple[str, int]] = []
+        warnings: list[str] = []
+        try:
+            for path in source.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = 0
+                files.append((path.relative_to(source).as_posix(), size))
+        except OSError as error:
+            warnings.append(f"读取 Mod 文件夹失败：{error}")
+        return _build_mod_descriptor(source, game, "directory", files, warnings)
+
+    suffix = source.suffix.casefold()
+    if suffix in MOD_ZIP_SUFFIXES:
+        files = []
+        warnings = []
+        try:
+            with zipfile.ZipFile(source) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    files.append((info.filename, info.file_size))
+        except (OSError, zipfile.BadZipFile) as error:
+            return ModDescriptor(
+                source=source,
+                game_key=game.key,
+                name=source.stem,
+                container_kind="zip",
+                mod_type="unknown",
+                type_label="压缩包错误",
+                target_root="",
+                total_size=0,
+                files=(),
+                error=f"无法读取 ZIP：{error}",
+            )
+        return _build_mod_descriptor(source, game, "zip", files, warnings)
+
+    if suffix in MOD_PAK_SUFFIXES and suffix != ".sig":
+        return _build_mod_descriptor(source, game, "file", [(source.name, source.stat().st_size)])
+
+    if suffix in MOD_UNSUPPORTED_ARCHIVE_SUFFIXES:
+        error = f"暂不支持 {suffix} 压缩包，请先解压为文件夹或重新打包为 ZIP。"
+    else:
+        error = "不支持该文件类型。支持 ZIP、Pak 文件和已解压的 Mod 文件夹。"
+    return ModDescriptor(
+        source=source,
+        game_key=game.key,
+        name=source.stem,
+        container_kind="unsupported",
+        mod_type="unknown",
+        type_label="不支持",
+        target_root="",
+        total_size=0,
+        files=(),
+        error=error,
+    )
+
+
+def scan_mod_library(library_directory: Path | str, game: GameProfile = DEFAULT_GAME) -> list[ModDescriptor]:
+    root = Path(str(library_directory).strip().strip('"'))
+    if not root.is_dir():
+        return []
+    supported_suffixes = MOD_ZIP_SUFFIXES | MOD_PAK_SUFFIXES | MOD_UNSUPPORTED_ARCHIVE_SUFFIXES
+    descriptors: list[ModDescriptor] = []
+    try:
+        children = sorted(root.iterdir(), key=lambda item: natural_key(item.name))
+    except OSError:
+        return []
+    for child in children:
+        if child.name.startswith(".") or child.name.startswith("~$"):
+            continue
+        if child.is_dir() or child.suffix.casefold() in supported_suffixes:
+            descriptors.append(scan_mod_source(child, game))
+    return descriptors
+
+
+def _resolve_mod_target(game_directory: Path, relative: str) -> Path:
+    root = game_directory.resolve()
+    target = (game_directory / Path(*PurePosixPath(relative).parts)).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"Mod 目标路径越过游戏目录：{relative}") from error
+    return target
+
+
+def _relative_to_game(game_directory: Path, path: Path) -> str:
+    return path.resolve().relative_to(game_directory.resolve()).as_posix()
+
+
+def _ensure_mod_parent_directories(game_directory: Path, target: Path, created_directories: list[str]) -> None:
+    missing: list[Path] = []
+    current = target.parent
+    root = game_directory.resolve()
+    while current != root:
+        if current.exists():
+            break
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for folder in reversed(missing):
+        folder.mkdir()
+        created_directories.append(_relative_to_game(game_directory, folder))
+
+
+def _write_payload_to_target(
+    descriptor: ModDescriptor,
+    payload: ModPayloadFile,
+    target: Path,
+    zip_handle: zipfile.ZipFile | None,
+) -> None:
+    temp_path: Path | None = None
+    try:
+        fd, raw_temp = tempfile.mkstemp(prefix=".bm-mod-", dir=str(target.parent))
+        os.close(fd)
+        temp_path = Path(raw_temp)
+        if descriptor.container_kind == "zip":
+            if zip_handle is None:
+                raise ValueError("ZIP 文件未打开。")
+            info = next(
+                (
+                    entry
+                    for entry in zip_handle.infolist()
+                    if _normalize_mod_entry_name(entry.filename) == payload.source_name
+                ),
+                None,
+            )
+            if info is None:
+                raise FileNotFoundError(f"ZIP 内找不到文件：{payload.source_name}")
+            with zip_handle.open(info) as source_handle, temp_path.open("wb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle)
+        elif descriptor.container_kind == "directory":
+            shutil.copy2(descriptor.source / Path(*PurePosixPath(payload.source_name).parts), temp_path)
+        elif descriptor.container_kind == "file":
+            shutil.copy2(descriptor.source, temp_path)
+        else:
+            raise ValueError(f"不支持的 Mod 容器：{descriptor.container_kind}")
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _restore_backup(backup: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(prefix=".bm-restore-", dir=str(target.parent))
+    os.close(fd)
+    temp = Path(raw_temp)
+    try:
+        shutil.copy2(backup, temp)
+        os.replace(temp, target)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _format_mod_file_error(action: str, path: Path, error: OSError) -> str:
+    winerror = getattr(error, "winerror", None)
+    if isinstance(error, PermissionError) or winerror in {5, 32, 33}:
+        reason = "文件被占用或没有权限"
+    else:
+        reason = "文件操作失败"
+    suffix = f"（WinError {winerror}）" if winerror else ""
+    return f"{reason}{suffix}：{path}\n{action}失败：{error}"
+
+
+def _installation_source_key(path: Path | str) -> str:
+    try:
+        return str(Path(path).resolve()).casefold()
+    except OSError:
+        return str(Path(path)).casefold()
+
+
+def _rollback_mod_install(
+    game_directory: Path,
+    created_files: list[str],
+    backups: dict[str, str],
+    created_directories: list[str],
+) -> tuple[list[str], list[str], dict[str, str], list[str]]:
+    errors: list[str] = []
+    remaining_files: list[str] = []
+    remaining_backups: dict[str, str] = {}
+    for relative in reversed(created_files):
+        target = _resolve_mod_target(game_directory, relative)
+        try:
+            target.unlink(missing_ok=True)
+        except OSError as error:
+            errors.append(_format_mod_file_error("回滚删除", target, error))
+            remaining_files.append(relative)
+    for relative, backup_text in backups.items():
+        backup = Path(backup_text)
+        target = _resolve_mod_target(game_directory, relative)
+        if relative in remaining_files:
+            remaining_backups[relative] = backup_text
+            continue
+        try:
+            if backup.is_file():
+                _restore_backup(backup, target)
+                backup.unlink(missing_ok=True)
+        except OSError as error:
+            errors.append(_format_mod_file_error("回滚恢复", target, error))
+            remaining_backups[relative] = backup_text
+    remaining_directories: list[str] = []
+    for relative in sorted(created_directories, key=lambda item: item.count("/"), reverse=True):
+        folder = _resolve_mod_target(game_directory, relative)
+        try:
+            folder.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            remaining_directories.append(relative)
+    return errors, remaining_files, remaining_backups, remaining_directories
+
+
+def install_mod(
+    descriptor: ModDescriptor,
+    game_directory: Path | str,
+    metadata_path: Path | str | None = None,
+    backup_root: Path | str | None = None,
+) -> ModOperationResult:
+    game = GAME_PROFILES.get(descriptor.game_key)
+    if game is None:
+        return ModOperationResult(False, "未知游戏，无法安装。")
+    game_root = Path(str(game_directory).strip().strip('"'))
+    if not is_valid_game_directory(game, game_root):
+        return ModOperationResult(False, f"游戏目录无效：{game_root}")
+    if not descriptor.installable:
+        return ModOperationResult(False, descriptor.error or "该 Mod 无法安装。")
+
+    targets: list[str] = []
+    for payload in descriptor.files:
+        try:
+            target = _resolve_mod_target(game_root, payload.target_relative)
+        except ValueError as error:
+            return ModOperationResult(False, str(error))
+        if payload.target_relative in targets:
+            return ModOperationResult(False, f"Mod 内包含重复目标文件：{payload.target_relative}")
+        if target.exists() and target.is_dir():
+            return ModOperationResult(False, f"目标文件位置已被文件夹占用：{target}")
+        targets.append(payload.target_relative)
+
+    installations = load_mod_installations(metadata_path)
+    target_set = set(targets)
+    for existing in installations:
+        conflict = sorted(target_set & set(existing.files))
+        if conflict:
+            return ModOperationResult(
+                False,
+                f"目标文件已由已安装 Mod“{existing.name}”管理，请先卸载它：\n{conflict[0]}",
+            )
+
+    installation_id = uuid.uuid4().hex
+    backups_root = Path(backup_root) if backup_root is not None else _mod_backup_root_dir()
+    backup_directory = backups_root / installation_id
+    created_files: list[str] = []
+    created_directories: list[str] = []
+    backups: dict[str, str] = {}
+    zip_handle: zipfile.ZipFile | None = None
+    try:
+        if descriptor.container_kind == "zip":
+            zip_handle = zipfile.ZipFile(descriptor.source)
+        for payload in descriptor.files:
+            target = _resolve_mod_target(game_root, payload.target_relative)
+            _ensure_mod_parent_directories(game_root, target, created_directories)
+            if target.exists() and payload.target_relative not in backups:
+                backup = backup_directory / Path(*PurePosixPath(payload.target_relative).parts)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                backups[payload.target_relative] = str(backup)
+            _write_payload_to_target(descriptor, payload, target, zip_handle)
+            created_files.append(payload.target_relative)
+    except Exception as error:
+        rollback_errors, remaining_files, remaining_backups, remaining_directories = _rollback_mod_install(
+            game_root, created_files, backups, created_directories
+        )
+        partial_installation: ModInstallation | None = None
+        if remaining_files or remaining_backups or remaining_directories:
+            partial_installation = ModInstallation(
+                id=installation_id,
+                game_key=game.key,
+                source=str(descriptor.source),
+                name=descriptor.name,
+                mod_type=descriptor.mod_type,
+                type_label=descriptor.type_label,
+                game_directory=str(game_root),
+                installed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                files=remaining_files,
+                directories=remaining_directories,
+                backups=remaining_backups,
+                status="partial",
+                last_error="\n".join(rollback_errors + [str(error)]),
+            )
+            installations.append(partial_installation)
+            save_mod_installations(installations, metadata_path)
+        errors = [f"安装失败：{error}"] + rollback_errors
+        return ModOperationResult(
+            False,
+            "安装失败，已尝试回滚。",
+            errors=errors,
+            installation=partial_installation,
+        )
+    finally:
+        if zip_handle is not None:
+            zip_handle.close()
+
+    installation = ModInstallation(
+        id=installation_id,
+        game_key=game.key,
+        source=str(descriptor.source),
+        name=descriptor.name,
+        mod_type=descriptor.mod_type,
+        type_label=descriptor.type_label,
+        game_directory=str(game_root),
+        installed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        files=sorted(created_files),
+        directories=sorted(set(created_directories), key=lambda item: (item.count("/"), item)),
+        backups=backups,
+        status="installed",
+    )
+    installations.append(installation)
+    save_mod_installations(installations, metadata_path)
+    return ModOperationResult(
+        True,
+        f"已安装 {descriptor.name}，共 {len(created_files)} 个文件。",
+        installation=installation,
+    )
+
+
+def uninstall_mod(
+    installation: ModInstallation,
+    metadata_path: Path | str | None = None,
+) -> ModOperationResult:
+    installations = load_mod_installations(metadata_path)
+    stored = next((item for item in installations if item.id == installation.id), installation)
+    game_root = Path(stored.game_directory)
+    errors: list[str] = []
+    remaining_files: list[str] = []
+    backup_files = list(stored.backups.values())
+
+    for relative in list(stored.files):
+        try:
+            target = _resolve_mod_target(game_root, relative)
+        except ValueError as error:
+            errors.append(str(error))
+            remaining_files.append(relative)
+            continue
+        try:
+            if target.exists() or target.is_symlink():
+                if target.is_dir():
+                    raise IsADirectoryError(f"目标是文件夹，拒绝自动删除：{target}")
+                target.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append(_format_mod_file_error("删除", target, error))
+            remaining_files.append(relative)
+
+    remaining_backups: dict[str, str] = {}
+    for relative, backup_text in list(stored.backups.items()):
+        backup = Path(backup_text)
+        try:
+            target = _resolve_mod_target(game_root, relative)
+        except ValueError as error:
+            errors.append(str(error))
+            remaining_backups[relative] = backup_text
+            continue
+        if relative in remaining_files:
+            remaining_backups[relative] = backup_text
+            continue
+        if not backup.is_file():
+            errors.append(f"备份文件不存在，无法恢复原文件：{backup}")
+            continue
+        try:
+            _restore_backup(backup, target)
+            backup.unlink(missing_ok=True)
+        except OSError as error:
+            errors.append(_format_mod_file_error("恢复原文件", target, error))
+            remaining_backups[relative] = backup_text
+
+    remaining_directories: list[str] = []
+    if not remaining_files and not remaining_backups:
+        for relative in sorted(stored.directories, key=lambda item: item.count("/"), reverse=True):
+            try:
+                folder = _resolve_mod_target(game_root, relative)
+                folder.rmdir()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                remaining_directories.append(relative)
+    else:
+        remaining_directories = list(stored.directories)
+
+    complete = not remaining_files and not remaining_backups
+    stored.files = remaining_files
+    stored.backups = remaining_backups
+    stored.directories = remaining_directories
+    stored.status = "installed" if complete else "partial"
+    stored.last_error = "\n".join(errors)
+    if complete:
+        installations = [item for item in installations if item.id != stored.id]
+        for backup_text in backup_files:
+            try:
+                backup = Path(backup_text)
+                if backup.parent.is_dir() and not any(backup.parent.iterdir()):
+                    backup.parent.rmdir()
+            except OSError:
+                pass
+    elif not any(item.id == stored.id for item in installations):
+        installations.append(stored)
+    save_mod_installations(installations, metadata_path)
+    if complete:
+        return ModOperationResult(True, f"已卸载 {stored.name}。", errors=errors)
+    return ModOperationResult(
+        False,
+        f"卸载未完成：仍有 {len(remaining_files)} 个文件，{len(remaining_backups)} 个原文件备份待恢复。",
+        errors=errors,
+        installation=stored,
+    )
 
 
 @dataclass
@@ -951,6 +2110,29 @@ def ensure_pbz_bridge_runtime() -> tuple[Path, Path]:
     return bridge_target, oodle_target
 
 
+def ensure_speedhack_runtime() -> Path:
+    if os.name != "nt":
+        raise RuntimeError("游戏速度修改仅支持 Windows。")
+    native = native_root_dir()
+    candidates = [
+        native / "TrSpeedHack_x64.dll",
+        native / "speedhack" / "TrSpeedHack_x64.dll",
+    ]
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise FileNotFoundError("缺少游戏速度组件 TrSpeedHack_x64.dll。")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "BlackMythSaveManager" / "SpeedHack"
+    runtime = base / f"speedhack-{digest}"
+    runtime.mkdir(parents=True, exist_ok=True)
+    target = runtime / "TrSpeedHack_x64.dll"
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    target_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else ""
+    if source_hash != target_hash:
+        shutil.copy2(source, target)
+    return target
+
+
 def _process_has_visible_window(pid: int) -> bool:
     user32 = _user32()
     found = False
@@ -1420,10 +2602,589 @@ class SlimProgressDialog(tk.Toplevel):
         self.update_idletasks()
 
 
+class ModManagerPanel(ttk.Frame):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        parent_app,
+        mod_settings: dict[str, dict[str, str]],
+        initial_game_key: str,
+        persist_callback,
+    ) -> None:
+        super().__init__(parent)
+        self.parent_app = parent_app
+        self.mod_settings = mod_settings
+        self.persist_callback = persist_callback
+        self.active_game_key = initial_game_key if initial_game_key in GAME_PROFILES else DEFAULT_GAME.key
+        self.rows: dict[str, tuple[ModDescriptor | None, ModInstallation | None]] = {}
+        self.source_keys: dict[str, str] = {}
+        self.library_var = tk.StringVar()
+        self.game_directory_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="正在读取 Mod 库…")
+
+        self._build_ui()
+        self._load_game_settings()
+        self.after(80, self._refresh)
+
+    def _px(self, value: int | float) -> int:
+        scale = getattr(self.parent_app, "dpi_scale", 1.0)
+        return max(1, int(round(float(value) * float(scale))))
+
+    @property
+    def current_game(self) -> GameProfile:
+        return GAME_PROFILES.get(self.active_game_key, DEFAULT_GAME)
+
+    def _game_config(self, game_key: str | None = None) -> dict[str, str]:
+        key = game_key or self.active_game_key
+        config = self.mod_settings.setdefault(key, {})
+        config.setdefault("library_directory", str(default_mod_library_dir(key)))
+        config.setdefault("game_directory", "")
+        return config
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self, padding=self._px(14))
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        paths = ttk.LabelFrame(outer, text=" Mod 库与游戏目录 ", padding=(10, 8))
+        paths.grid(row=0, column=0, sticky="ew", pady=(10, 10))
+        paths.columnconfigure(1, weight=1)
+
+        ttk.Label(paths, text="Mod 库：").grid(row=0, column=0, sticky="w", pady=3)
+        library_entry = ttk.Entry(paths, textvariable=self.library_var)
+        library_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=3)
+        library_entry.bind("<Return>", lambda _event: self._refresh())
+        ttk.Button(paths, text="浏览…", command=self._browse_library).grid(row=0, column=2, padx=(0, 6), pady=3)
+        ttk.Button(paths, text="读取/刷新", command=self._refresh).grid(row=0, column=3, pady=3)
+
+        ttk.Label(paths, text="游戏安装目录：").grid(row=1, column=0, sticky="w", pady=3)
+        game_entry = ttk.Entry(paths, textvariable=self.game_directory_var)
+        game_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=3)
+        game_entry.bind("<Return>", lambda _event: self._remember_game_paths())
+        ttk.Button(paths, text="浏览…", command=self._browse_game_directory).grid(
+            row=1, column=2, padx=(0, 6), pady=3
+        )
+        ttk.Button(paths, text="自动识别", command=self._auto_detect_game_directory).grid(row=1, column=3, pady=3)
+        ttk.Label(
+            paths,
+            text="提示：支持 ZIP、Pak 文件与已解压的 Mod 文件夹；7z/RAR 请先解压。",
+            style="Muted.TLabel",
+            wraplength=self._px(820),
+        ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
+
+        toolbar = ttk.Frame(outer)
+        toolbar.grid(row=1, column=0, sticky="new", pady=(0, 8))
+        self.install_button = ttk.Button(
+            toolbar, text="安装所选 Mod", style="Accent.TButton", command=self._install_selected, state="disabled"
+        )
+        self.install_button.pack(side="left", padx=(0, 8))
+        self.uninstall_button = ttk.Button(
+            toolbar, text="卸载所选 Mod", command=self._uninstall_selected, state="disabled"
+        )
+        self.uninstall_button.pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="打开 Mod 库", command=self._open_library).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="打开游戏目录", command=self._open_game_directory).pack(side="left", padx=(0, 8))
+        self.launch_button = ttk.Button(toolbar, text="启动游戏", command=self._launch_game)
+        self.launch_button.pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="刷新", command=self._refresh).pack(side="left")
+
+        paned = ttk.Panedwindow(outer, orient="horizontal")
+        paned.grid(row=2, column=0, sticky="nsew")
+
+        list_frame = ttk.Frame(paned, padding=(0, 0, 6, 0))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+        paned.add(list_frame, weight=4)
+
+        columns = ("name", "type", "target", "size", "status")
+        self.mod_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
+        headings = {
+            "name": "Mod",
+            "type": "识别类型",
+            "target": "安装位置",
+            "size": "大小",
+            "status": "状态",
+        }
+        widths = {"name": 235, "type": 145, "target": 315, "size": 85, "status": 120}
+        for column in columns:
+            self.mod_tree.heading(column, text=headings[column])
+            anchor = "e" if column == "size" else "w"
+            self.mod_tree.column(
+                column,
+                width=self.parent_app._table_column_width_px("mod_tree", column, widths[column]),
+                minwidth=self._px(70),
+                anchor=anchor,
+                stretch=False,
+            )
+        self.mod_tree.grid(row=0, column=0, sticky="nsew")
+        tree_y = ttk.Scrollbar(list_frame, orient="vertical", command=self.mod_tree.yview)
+        tree_y.grid(row=0, column=1, sticky="ns")
+        tree_x = ttk.Scrollbar(list_frame, orient="horizontal", command=self.mod_tree.xview)
+        tree_x.grid(row=1, column=0, sticky="ew")
+        self.mod_tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        self.mod_tree.tag_configure("installed", foreground="#147a3d", font=("Microsoft YaHei UI", 10, "bold"))
+        self.mod_tree.tag_configure("partial", foreground="#b45309", font=("Microsoft YaHei UI", 10, "bold"))
+        self.mod_tree.tag_configure("error", foreground="#b91c1c")
+        self.mod_tree.tag_configure("ready", foreground="#1f4f82")
+        self.mod_tree.bind("<<TreeviewSelect>>", self._on_mod_select)
+        self.parent_app._bind_tree_column_widths("mod_tree", self.mod_tree)
+
+        detail_frame = ttk.Frame(paned, padding=(8, 0, 0, 0))
+        detail_frame.rowconfigure(1, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        paned.add(detail_frame, weight=3)
+        ttk.Label(detail_frame, text="Mod 详情", style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.detail_text = tk.Text(
+            detail_frame,
+            wrap="word",
+            height=20,
+            relief="solid",
+            borderwidth=1,
+            font=("Microsoft YaHei UI", 9),
+            padx=self._px(8),
+            pady=self._px(7),
+        )
+        self.detail_text.grid(row=1, column=0, sticky="nsew")
+        detail_y = ttk.Scrollbar(detail_frame, orient="vertical", command=self.detail_text.yview)
+        detail_y.grid(row=1, column=1, sticky="ns")
+        self.detail_text.configure(yscrollcommand=detail_y.set, state="disabled")
+
+        status = ttk.Frame(outer)
+        status.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        status.columnconfigure(0, weight=1)
+        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            status,
+            text="卸载失败的文件会保留安装记录，退出游戏后可再次卸载。",
+            style="Muted.TLabel",
+        ).grid(row=0, column=1, sticky="e")
+
+    def _load_game_settings(self) -> None:
+        config = self._game_config()
+        self.library_var.set(str(config.get("library_directory") or default_mod_library_dir(self.active_game_key)))
+        game_directory = str(config.get("game_directory") or "").strip()
+        if not game_directory:
+            detected = detect_game_install_dir(self.current_game)
+            if detected is not None:
+                game_directory = str(detected)
+                config["game_directory"] = game_directory
+        self.game_directory_var.set(game_directory)
+
+    def _remember_game_paths(self) -> None:
+        config = self._game_config()
+        config["library_directory"] = self.library_var.get().strip()
+        config["game_directory"] = self.game_directory_var.get().strip()
+
+    def _persist(self) -> None:
+        self._remember_game_paths()
+        try:
+            self.persist_callback(self.mod_settings)
+        except Exception:
+            pass
+
+    def set_game(self, game_key: str) -> None:
+        if game_key not in GAME_PROFILES or game_key == self.active_game_key:
+            return
+        self._persist()
+        self.active_game_key = game_key
+        self._load_game_settings()
+        self._refresh()
+
+    def _browse_library(self) -> None:
+        initial = self.library_var.get().strip()
+        if not Path(initial).is_dir():
+            initial = str(default_mod_library_dir(self.active_game_key))
+        selected = filedialog.askdirectory(
+            parent=self,
+            title=f"选择《{self.current_game.display_name}》的 Mod 库",
+            initialdir=initial if Path(initial).is_dir() else None,
+        )
+        if selected:
+            self.library_var.set(selected)
+            self._refresh()
+
+    def _browse_game_directory(self) -> None:
+        initial = self.game_directory_var.get().strip()
+        selected = filedialog.askdirectory(
+            parent=self,
+            title=f"选择《{self.current_game.display_name}》的游戏安装目录",
+            initialdir=initial if Path(initial).is_dir() else None,
+        )
+        if selected:
+            self.game_directory_var.set(selected)
+            self._persist()
+            self._refresh()
+
+    def _auto_detect_game_directory(self, show_message: bool = True) -> bool:
+        detected = detect_game_install_dir(self.current_game)
+        if detected is None:
+            if show_message:
+                messagebox.showwarning(
+                    "未找到游戏目录",
+                    "未能通过 Steam 库或存档路径定位游戏安装目录，请手动选择。",
+                    parent=self,
+                )
+            return False
+        self.game_directory_var.set(str(detected))
+        self._persist()
+        if show_message:
+            messagebox.showinfo("已识别游戏目录", str(detected), parent=self)
+        self._refresh()
+        return True
+
+    def _installation_source_key(self, installation: ModInstallation) -> str:
+        return _installation_source_key(installation.source)
+
+    def _refresh(self) -> None:
+        selection = self._selected_source_key()
+        self._remember_game_paths()
+        self._persist()
+        for item in self.mod_tree.get_children():
+            self.mod_tree.delete(item)
+        self.rows.clear()
+        self.source_keys.clear()
+
+        library = Path(self.library_var.get().strip().strip('"'))
+        if not library.is_dir():
+            self.status_var.set(f"Mod 库不存在：{library}")
+            self._set_details("Mod 库路径无效。\n\n请点击“浏览…”选择包含 ZIP、Pak 或已解压 Mod 文件夹的目录。")
+            self._update_action_buttons()
+            return
+
+        self.status_var.set("正在读取 Mod 库…")
+        self.update_idletasks()
+        descriptors = scan_mod_library(library, self.current_game)
+        installations = [item for item in load_mod_installations() if item.game_key == self.active_game_key]
+        by_source = {self._installation_source_key(item): item for item in installations}
+        used_installations: set[str] = set()
+        inserted = 0
+
+        for descriptor in descriptors:
+            source_key = _installation_source_key(descriptor.source)
+            installation = by_source.get(source_key)
+            if installation is not None:
+                used_installations.add(installation.id)
+            self._insert_mod_row(descriptor, installation, source_key)
+            inserted += 1
+
+        for installation in installations:
+            if installation.id in used_installations:
+                continue
+            self._insert_mod_row(None, installation, self._installation_source_key(installation))
+            inserted += 1
+
+        installed_count = len(installations)
+        partial_count = sum(1 for item in installations if item.status == "partial" or item.files or item.backups)
+        summary = f"已读取 {inserted} 个 Mod；已安装 {installed_count} 个"
+        if partial_count:
+            summary += f"，其中 {partial_count} 个卸载/回滚未完成"
+        self.status_var.set(summary)
+        target_selection = next(
+            (item for item in self.mod_tree.get_children() if self.source_keys.get(item) == selection),
+            None,
+        )
+        children = self.mod_tree.get_children()
+        if target_selection is not None:
+            self.mod_tree.selection_set(target_selection)
+            self.mod_tree.focus(target_selection)
+            self.mod_tree.see(target_selection)
+        elif children:
+            self.mod_tree.selection_set(children[0])
+            self.mod_tree.focus(children[0])
+        else:
+            self._set_details("当前 Mod 库中没有可显示的 Mod。")
+            self._update_action_buttons()
+
+    def _insert_mod_row(
+        self,
+        descriptor: ModDescriptor | None,
+        installation: ModInstallation | None,
+        source_key: str,
+    ) -> None:
+        if descriptor is not None:
+            name = descriptor.name
+            type_label = descriptor.type_label
+            target = descriptor.target_root.replace("/", "\\") if descriptor.target_root else "—"
+            size = descriptor.total_size
+            if installation is not None and installation.status == "partial":
+                status, tag = "卸载未完成", "partial"
+            elif installation is not None:
+                status, tag = "已安装", "installed"
+            elif descriptor.error or not descriptor.installable:
+                status, tag = "无法识别", "error"
+            else:
+                status, tag = "未安装", "ready"
+        else:
+            assert installation is not None
+            name = f"{installation.name}（库文件已移走）"
+            type_label = installation.type_label
+            target_root = _common_target_root(installation.files)
+            target = target_root.replace("/", "\\") if target_root else "—"
+            size = 0
+            partial = installation.status == "partial" or bool(installation.files or installation.backups)
+            status, tag = ("卸载未完成", "partial") if partial else ("已安装", "installed")
+        item = self.mod_tree.insert(
+            "",
+            "end",
+            values=(name, type_label, target, format_size(size) if size else "—", status),
+            tags=(tag,),
+        )
+        self.rows[item] = (descriptor, installation)
+        self.source_keys[item] = source_key
+
+    def _selected_source_key(self) -> str | None:
+        selection = self.mod_tree.selection()
+        if not selection:
+            return None
+        return self.source_keys.get(selection[0])
+
+    def _on_mod_select(self, _event=None) -> None:
+        selection = self.mod_tree.selection()
+        if not selection:
+            self._set_details("请选择一个 Mod。")
+            self._update_action_buttons()
+            return
+        descriptor, installation = self.rows.get(selection[0], (None, None))
+        self._show_mod_details(descriptor, installation)
+        self._update_action_buttons()
+
+    def _absolute_mod_target(self, target_root: str) -> str:
+        game_directory = self.game_directory_var.get().strip()
+        if not target_root:
+            return "—"
+        relative = Path(*PurePosixPath(target_root).parts)
+        if game_directory:
+            return str(Path(game_directory) / relative)
+        return f"<游戏目录>\\{relative}"
+
+    def _set_details(self, text: str) -> None:
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", text)
+        self.detail_text.configure(state="disabled")
+
+    def _show_mod_details(
+        self,
+        descriptor: ModDescriptor | None,
+        installation: ModInstallation | None,
+    ) -> None:
+        lines: list[str] = []
+        if descriptor is not None:
+            lines.extend(
+                [
+                    f"名称：{descriptor.name}",
+                    f"来源：{descriptor.source}",
+                    f"识别类型：{descriptor.type_label}",
+                    f"安装位置：{self._absolute_mod_target(descriptor.target_root)}",
+                    f"包内文件：{len(descriptor.files)} 个，{format_size(descriptor.total_size)}",
+                ]
+            )
+            if descriptor.error:
+                lines.extend(["", f"识别失败：{descriptor.error}"])
+            if descriptor.warnings:
+                lines.append("")
+                lines.extend(f"注意：{warning}" for warning in descriptor.warnings)
+        if installation is not None:
+            lines.extend(
+                [
+                    "",
+                    f"安装状态：{'卸载未完成' if installation.status == 'partial' else '已安装'}",
+                    f"安装时间：{installation.installed_at or '—'}",
+                    f"游戏目录：{installation.game_directory}",
+                    f"安装文件：{len(installation.files)} 个；待恢复备份：{len(installation.backups)} 个",
+                ]
+            )
+            if installation.last_error:
+                lines.extend(["", "最近错误：", installation.last_error])
+        if descriptor is not None and descriptor.files:
+            lines.extend(["", f"将安装的文件（最多显示 100 个，共 {len(descriptor.files)} 个）："])
+            for payload in descriptor.files[:100]:
+                lines.append(f"  {payload.target_relative}")
+            if len(descriptor.files) > 100:
+                lines.append(f"  …其余 {len(descriptor.files) - 100} 个文件未显示")
+        elif installation is not None:
+            pending = installation.files[:100]
+            if pending:
+                lines.extend(["", "尚未删除的文件："])
+                lines.extend(f"  {relative}" for relative in pending)
+            backup_rels = sorted(installation.backups)[:100]
+            if backup_rels:
+                lines.extend(["", "等待恢复的原文件备份："])
+                lines.extend(f"  {relative}" for relative in backup_rels)
+        if not lines:
+            lines.append("没有可显示的 Mod 信息。")
+        self._set_details("\n".join(lines))
+
+    def _update_action_buttons(self) -> None:
+        selection = self.mod_tree.selection()
+        descriptor, installation = self.rows.get(selection[0], (None, None)) if selection else (None, None)
+        can_install = bool(descriptor is not None and descriptor.installable and installation is None)
+        can_uninstall = installation is not None
+        self.install_button.configure(state="normal" if can_install else "disabled")
+        self.uninstall_button.configure(state="normal" if can_uninstall else "disabled")
+
+    def _select_source(self, source_key: str | None) -> None:
+        if source_key is None:
+            return
+        for item in self.mod_tree.get_children():
+            if self.source_keys.get(item) == source_key:
+                self.mod_tree.selection_set(item)
+                self.mod_tree.focus(item)
+                self.mod_tree.see(item)
+                return
+
+    def _install_selected(self) -> None:
+        selection = self.mod_tree.selection()
+        descriptor, installation = self.rows.get(selection[0], (None, None)) if selection else (None, None)
+        if descriptor is None:
+            return
+        if installation is not None:
+            messagebox.showinfo("已经安装", "该 Mod 已有安装记录，如需更新请先卸载再安装。", parent=self)
+            return
+        if not descriptor.installable:
+            messagebox.showwarning("无法安装", descriptor.error or "该 Mod 结构无法识别。", parent=self)
+            return
+
+        game_directory = Path(self.game_directory_var.get().strip().strip('"'))
+        if not is_valid_game_directory(self.current_game, game_directory):
+            if self._auto_detect_game_directory(show_message=False):
+                game_directory = Path(self.game_directory_var.get().strip())
+            if not is_valid_game_directory(self.current_game, game_directory):
+                messagebox.showwarning(
+                    "游戏目录无效",
+                    "请先选择正确的游戏安装目录。\n\n"
+                    "黑猴应包含 b1 文件夹；影之刃应包含 ProjectPBZ 和 platform\\steam。",
+                    parent=self,
+                )
+                return
+
+        target = self._absolute_mod_target(descriptor.target_root)
+        warnings = "".join(f"\n注意：{warning}" for warning in descriptor.warnings)
+        message = (
+            f"Mod：{descriptor.name}\n"
+            f"类型：{descriptor.type_label}\n"
+            f"文件：{len(descriptor.files)} 个（{format_size(descriptor.total_size)}）\n"
+            f"安装到：{target}{warnings}\n\n"
+            "是否继续安装？已有同名文件会先备份，卸载时恢复。"
+        )
+        if is_game_running(self.current_game):
+            message += "\n\n游戏正在运行，安装可能因文件占用失败。建议先完全退出游戏。"
+        if not messagebox.askyesno("安装 Mod", message, parent=self):
+            return
+
+        source_key = self.source_keys.get(selection[0])
+        self.configure(cursor="watch")
+        self.status_var.set(f"正在安装 {descriptor.name}…")
+        self.update_idletasks()
+        try:
+            result = install_mod(descriptor, game_directory)
+        except Exception as error:
+            result = ModOperationResult(False, "安装时发生未处理错误。", errors=[str(error)])
+        finally:
+            self.configure(cursor="")
+
+        self._refresh()
+        self._select_source(source_key)
+        if result.ok:
+            self.status_var.set(result.message)
+            messagebox.showinfo("安装完成", result.message, parent=self)
+            return
+        details = "\n".join(result.errors[:12]) if result.errors else result.message
+        self.status_var.set(result.message)
+        if result.installation is not None:
+            messagebox.showwarning(
+                "安装失败，回滚未完成",
+                f"{result.message}\n\n{details}\n\n"
+                "已保留卸载记录。请退出游戏或关闭占用文件的程序后，在列表中点击“卸载所选 Mod”重试。",
+                parent=self,
+            )
+        else:
+            messagebox.showerror("安装失败", f"{result.message}\n\n{details}", parent=self)
+
+    def _uninstall_selected(self) -> None:
+        selection = self.mod_tree.selection()
+        descriptor, installation = self.rows.get(selection[0], (None, None)) if selection else (None, None)
+        if installation is None:
+            return
+        running = is_game_running(self.current_game)
+        message = (
+            f"确定卸载 Mod“{installation.name}”吗？\n\n"
+            f"将删除 {len(installation.files)} 个由本程序安装的文件"
+        )
+        if installation.backups:
+            message += f"，并恢复 {len(installation.backups)} 个安装前备份"
+        message += "。\n\n只会处理安装清单中的文件，不会删除整个共享目录。"
+        if running:
+            message += "\n\n游戏正在运行，DLL/Pak 等文件可能被占用；即使卸载失败也会保留记录以便重试。"
+        if not messagebox.askyesno("卸载 Mod", message, parent=self):
+            return
+
+        source_key = self.source_keys.get(selection[0])
+        self.configure(cursor="watch")
+        self.status_var.set(f"正在卸载 {installation.name}…")
+        self.update_idletasks()
+        try:
+            result = uninstall_mod(installation)
+        except Exception as error:
+            result = ModOperationResult(False, "卸载时发生未处理错误。", errors=[str(error)])
+        finally:
+            self.configure(cursor="")
+
+        self._refresh()
+        self._select_source(source_key)
+        if result.ok:
+            self.status_var.set(result.message)
+            if result.errors:
+                messagebox.showwarning(
+                    "卸载完成，但有警告",
+                    f"{result.message}\n\n" + "\n".join(result.errors[:12]),
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo("卸载完成", result.message, parent=self)
+            return
+
+        details = "\n".join(result.errors[:12]) if result.errors else result.message
+        self.status_var.set(result.message)
+        messagebox.showwarning(
+            "卸载未完成",
+            f"{result.message}\n\n{details}\n\n"
+            "文件占用通常会在完全退出游戏、关闭 Mod 工具或稍等杀毒软件扫描结束后解除。"
+            "安装记录和未完成的备份均已保留，可稍后再次点击“卸载所选 Mod”。",
+            parent=self,
+        )
+
+    def _open_library(self) -> None:
+        path = Path(self.library_var.get().strip().strip('"'))
+        if path.is_dir():
+            try:
+                os.startfile(str(path))
+            except OSError as error:
+                messagebox.showerror("打开失败", str(error), parent=self)
+
+    def _open_game_directory(self) -> None:
+        path = Path(self.game_directory_var.get().strip().strip('"'))
+        if path.is_dir():
+            try:
+                os.startfile(str(path))
+            except OSError as error:
+                messagebox.showerror("打开失败", str(error), parent=self)
+
+    def _launch_game(self) -> None:
+        self._remember_game_paths()
+        ok, message = launch_game_from_steam(self.current_game)
+        self.status_var.set(message)
+        if not ok:
+            messagebox.showerror("启动游戏失败", message, parent=self)
+
 class SaveManagerApp:
     def __init__(self) -> None:
         self.settings = load_settings()
         self.game_settings = normalize_game_settings(self.settings)
+        self.mod_settings = normalize_mod_settings(self.settings)
+        self.trainer_settings = trainer_core.normalize_trainer_settings(self.settings.get("trainers"))
+        self.column_widths = normalize_column_widths(self.settings.get("column_widths"))
         self.active_game_key = initial_game_key(self.settings)
         self.runtime_backup_preference: str | None = None
         self.source_root: Path | None = None
@@ -1437,6 +3198,7 @@ class SaveManagerApp:
         self.slim_queue: queue.Queue | None = None
         self.slim_dialog: SlimProgressDialog | None = None
         self.slim_target_root: Path | None = None
+        self.trainer_panel: trainer_core.TrainerPanel | None = None
         self._suppress_settings = True
 
         self.root = tk.Tk()
@@ -1498,6 +3260,51 @@ class SaveManagerApp:
     def _px(self, value: int | float) -> int:
         return max(1, int(round(float(value) * self.dpi_scale)))
 
+    def _table_column_width_px(self, table_key: str, column: str, default: int) -> int:
+        width = self.column_widths.get(table_key, {}).get(column, default)
+        return self._px(width)
+
+    def _remember_table_column_width(self, table_key: str, column: str, physical_width: int) -> None:
+        if physical_width <= 1:
+            return
+        logical_width = int(round(float(physical_width) / max(self.dpi_scale, 0.01)))
+        logical_width = max(COLUMN_WIDTH_MIN, min(COLUMN_WIDTH_MAX, logical_width))
+        columns = self.column_widths.setdefault(table_key, {})
+        if columns.get(column) == logical_width:
+            return
+        columns[column] = logical_width
+        self._persist_settings()
+
+    def _tree_columns(self, tree: ttk.Treeview) -> list[str]:
+        columns = [str(column) for column in tree["columns"]]
+        if "tree" in str(tree.cget("show")).split():
+            columns.insert(0, "#0")
+        return columns
+
+    def _remember_tree_column_widths(self, table_key: str, tree: ttk.Treeview) -> None:
+        if not tree.winfo_exists():
+            return
+        columns = self.column_widths.setdefault(table_key, {})
+        changed = False
+        for column in self._tree_columns(tree):
+            try:
+                physical_width = int(tree.column(column, "width"))
+            except (tk.TclError, TypeError, ValueError):
+                continue
+            logical_width = int(round(float(physical_width) / max(self.dpi_scale, 0.01)))
+            logical_width = max(COLUMN_WIDTH_MIN, min(COLUMN_WIDTH_MAX, logical_width))
+            if columns.get(column) != logical_width:
+                columns[column] = logical_width
+                changed = True
+        if changed:
+            self._persist_settings()
+
+    def _bind_tree_column_widths(self, table_key: str, tree: ttk.Treeview) -> None:
+        def capture(_event=None) -> None:
+            self.root.after_idle(lambda: self._remember_tree_column_widths(table_key, tree))
+
+        tree.bind("<ButtonRelease-1>", capture, add="+")
+
     def _set_initial_sash(self) -> None:
         try:
             width = self.paned.winfo_width()
@@ -1513,7 +3320,7 @@ class SaveManagerApp:
         outer = ttk.Frame(self.root, padding=self._px(14))
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=1)
+        outer.rowconfigure(1, weight=1)
 
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -1521,48 +3328,65 @@ class SaveManagerApp:
         ttk.Label(header, text=APP_NAME, style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="双游戏存档库 · 自动定位 Steam 当前存档 · 覆盖前可选备份",
+            text="双游戏存档库 · Mod 安装与安全卸载 · 修改器自动连接",
             style="Muted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(header, text="打开备份目录", command=self._open_backup_root).grid(row=0, column=1, rowspan=2, sticky="e")
-
-        paths = ttk.LabelFrame(outer, text=" 路径设置 ", padding=(10, 8))
-        paths.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        paths.columnconfigure(1, weight=1)
-
-        ttk.Label(paths, text="当前游戏：").grid(row=0, column=0, sticky="w", pady=3)
+        header_tools = ttk.Frame(header)
+        header_tools.grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Label(header_tools, text="当前游戏：").pack(side="left", padx=(0, 6))
         self.game_combo = ttk.Combobox(
-            paths,
+            header_tools,
             textvariable=self.game_var,
             values=tuple(profile.display_name for profile in GAME_PROFILES.values()),
             state="readonly",
             width=20,
         )
-        self.game_combo.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=3)
+        self.game_combo.pack(side="left", padx=(0, 10))
         self.game_combo.bind("<<ComboboxSelected>>", self._on_game_changed)
+        ttk.Button(header_tools, text="打开备份目录", command=self._open_backup_root).pack(side="left")
 
-        ttk.Label(paths, text="存档库：").grid(row=1, column=0, sticky="w", pady=3)
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
+        self.save_tab = ttk.Frame(self.notebook)
+        self.save_tab.columnconfigure(0, weight=1)
+        self.save_tab.rowconfigure(2, weight=1)
+        self.mod_tab = ttk.Frame(self.notebook)
+        self.mod_tab.columnconfigure(0, weight=1)
+        self.mod_tab.rowconfigure(0, weight=1)
+        self.trainer_tab = ttk.Frame(self.notebook)
+        self.trainer_tab.columnconfigure(0, weight=1)
+        self.trainer_tab.rowconfigure(0, weight=1)
+        self.notebook.add(self.save_tab, text="存档管理")
+        self.notebook.add(self.mod_tab, text="Mod 管理")
+        self.notebook.add(self.trainer_tab, text="修改器")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
+        paths = ttk.LabelFrame(self.save_tab, text=" 存档路径设置 ", padding=(10, 8))
+        paths.grid(row=0, column=0, sticky="ew", pady=(10, 10))
+        paths.columnconfigure(1, weight=1)
+
+        ttk.Label(paths, text="存档库：").grid(row=0, column=0, sticky="w", pady=3)
         source_entry = ttk.Entry(paths, textvariable=self.source_var)
-        source_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=3)
+        source_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=3)
         source_entry.bind("<Return>", lambda _event: self._load_source())
-        ttk.Button(paths, text="浏览…", command=self._browse_source).grid(row=1, column=2, padx=(0, 6), pady=3)
-        ttk.Button(paths, text="读取/刷新", command=self._load_source).grid(row=1, column=3, pady=3)
+        ttk.Button(paths, text="浏览…", command=self._browse_source).grid(row=0, column=2, padx=(0, 6), pady=3)
+        ttk.Button(paths, text="读取/刷新", command=self._load_source).grid(row=0, column=3, pady=3)
 
-        ttk.Label(paths, text="当前存档目录：").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(paths, text="当前存档目录：").grid(row=1, column=0, sticky="w", pady=3)
         current_entry = ttk.Entry(paths, textvariable=self.current_var)
-        current_entry.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=3)
+        current_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=3)
         current_entry.bind("<Return>", lambda _event: self._normalize_current_path(show_message=True))
-        ttk.Button(paths, text="浏览…", command=self._browse_current).grid(row=2, column=2, padx=(0, 6), pady=3)
-        ttk.Button(paths, text="自动识别", command=self._auto_detect_current).grid(row=2, column=3, pady=3)
+        ttk.Button(paths, text="浏览…", command=self._browse_current).grid(row=1, column=2, padx=(0, 6), pady=3)
+        ttk.Button(paths, text="自动识别", command=self._auto_detect_current).grid(row=1, column=3, pady=3)
         ttk.Label(
             paths,
             textvariable=self.path_hint_var,
             style="Muted.TLabel",
             wraplength=self._px(820),
-        ).grid(row=3, column=1, columnspan=3, sticky="w", pady=(4, 0))
+        ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(4, 0))
 
-        toolbar = ttk.Frame(outer)
-        toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        toolbar = ttk.Frame(self.save_tab)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.overwrite_button = ttk.Button(
             toolbar,
             text="覆盖当前存档",
@@ -1585,8 +3409,8 @@ class SaveManagerApp:
         self.delete_folder_button.pack(side="left", padx=(0, 8))
         ttk.Button(toolbar, text="在资源管理器中打开", command=self._open_selected).pack(side="right")
 
-        self.paned = ttk.Panedwindow(outer, orient="horizontal")
-        self.paned.grid(row=3, column=0, sticky="nsew")
+        self.paned = ttk.Panedwindow(self.save_tab, orient="horizontal")
+        self.paned.grid(row=2, column=0, sticky="nsew")
 
         tree_frame = ttk.Frame(self.paned, padding=(0, 0, 6, 0))
         tree_frame.rowconfigure(0, weight=1)
@@ -1598,9 +3422,23 @@ class SaveManagerApp:
         self.tree.heading("#0", text="存档名称")
         self.tree.heading("total_size", text="总大小")
         self.tree.heading("modified", text="修改时间")
-        self.tree.column("#0", width=self._px(360), minwidth=self._px(220), stretch=True)
-        self.tree.column("total_size", width=self._px(85), minwidth=self._px(75), anchor="e", stretch=False)
-        self.tree.column("modified", width=self._px(135), minwidth=self._px(115), anchor="center", stretch=False)
+        self.tree.column(
+            "#0", width=self._table_column_width_px("save_tree", "#0", 360), minwidth=self._px(220), stretch=True
+        )
+        self.tree.column(
+            "total_size",
+            width=self._table_column_width_px("save_tree", "total_size", 85),
+            minwidth=self._px(75),
+            anchor="e",
+            stretch=False,
+        )
+        self.tree.column(
+            "modified",
+            width=self._table_column_width_px("save_tree", "modified", 135),
+            minwidth=self._px(115),
+            anchor="center",
+            stretch=False,
+        )
         self.tree.grid(row=0, column=0, sticky="nsew")
         tree_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         tree_y.grid(row=0, column=1, sticky="ns")
@@ -1612,6 +3450,7 @@ class SaveManagerApp:
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Double-1>", self._on_tree_double_click)
         self.tree.bind("<Button-3>", self._show_context_menu)
+        self._bind_tree_column_widths("save_tree", self.tree)
 
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu_indices: dict[str, int] = {}
@@ -1651,19 +3490,62 @@ class SaveManagerApp:
         self.file_tree.heading("#0", text="文件名")
         self.file_tree.heading("size", text="大小")
         self.file_tree.heading("modified", text="修改时间")
-        self.file_tree.column("#0", width=self._px(250), minwidth=self._px(170), stretch=True)
-        self.file_tree.column("size", width=self._px(95), minwidth=self._px(80), anchor="e", stretch=False)
-        self.file_tree.column("modified", width=self._px(165), minwidth=self._px(145), anchor="center", stretch=False)
+        self.file_tree.column(
+            "#0", width=self._table_column_width_px("save_files", "#0", 250), minwidth=self._px(170), stretch=True
+        )
+        self.file_tree.column(
+            "size",
+            width=self._table_column_width_px("save_files", "size", 95),
+            minwidth=self._px(80),
+            anchor="e",
+            stretch=False,
+        )
+        self.file_tree.column(
+            "modified",
+            width=self._table_column_width_px("save_files", "modified", 165),
+            minwidth=self._px(145),
+            anchor="center",
+            stretch=False,
+        )
         self.file_tree.grid(row=4, column=0, sticky="nsew")
         file_y = ttk.Scrollbar(detail_frame, orient="vertical", command=self.file_tree.yview)
         file_y.grid(row=4, column=1, sticky="ns")
         self.file_tree.configure(yscrollcommand=file_y.set)
+        self._bind_tree_column_widths("save_files", self.file_tree)
 
-        status = ttk.Frame(outer)
-        status.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        status = ttk.Frame(self.save_tab)
+        status.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         status.columnconfigure(0, weight=1)
         ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(status, textvariable=self.overwrite_hint_var, style="Muted.TLabel").grid(row=0, column=1, sticky="e")
+
+        self.mod_panel = ModManagerPanel(
+            self.mod_tab,
+            self,
+            self.mod_settings,
+            self.active_game_key,
+            self._persist_mod_settings,
+        )
+        self.mod_panel.grid(row=0, column=0, sticky="nsew")
+        try:
+            trainer_bridge_path = ensure_pbz_bridge_runtime()[0]
+        except (OSError, RuntimeError, FileNotFoundError):
+            trainer_bridge_path = Path()
+        try:
+            trainer_speedhack_path = ensure_speedhack_runtime()
+        except (OSError, RuntimeError, FileNotFoundError):
+            trainer_speedhack_path = Path()
+        self.trainer_panel = trainer_core.TrainerPanel(
+            self.trainer_tab,
+            self,
+            self.trainer_settings,
+            self.active_game_key,
+            self._persist_trainer_settings,
+            self._px,
+            trainer_bridge_path,
+            trainer_speedhack_path,
+        )
+        self.trainer_panel.grid(row=0, column=0, sticky="nsew")
 
 
     def _load_initial_settings(self) -> None:
@@ -1745,8 +3627,22 @@ class SaveManagerApp:
         self._restore_game_paths()
         self._update_path_hint()
         self._set_status(f"已切换到《{profile.display_name}》，正在恢复该游戏配置…")
+        if self.mod_panel is not None:
+            self.mod_panel.set_game(profile.key)
+        if self.trainer_panel is not None:
+            self.trainer_panel.set_game(profile.key)
         self._persist_settings()
         self.root.after_idle(lambda game_key=profile.key: self._start_game_scan(game_key))
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        if self.trainer_panel is None:
+            return
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
+            return
+        if selected == str(self.trainer_tab):
+            self.trainer_panel.activate()
 
     def _startup_scan(self) -> None:
         self._start_game_scan(self.active_game_key)
@@ -1765,8 +3661,13 @@ class SaveManagerApp:
         self._remember_active_paths()
         data = {
             "version": SETTINGS_VERSION,
+            "mods_version": MOD_SETTINGS_VERSION,
             "game": self.active_game_key,
             "games": self.game_settings,
+            "mods": self.mod_settings,
+            "trainers": self.trainer_settings,
+            "trainers_version": trainer_core.TRAINER_SETTINGS_VERSION,
+            "column_widths": self.column_widths,
             "geometry": self.root.geometry(),
             "ui_scale": self.dpi_scale,
         }
@@ -2703,10 +4604,20 @@ class SaveManagerApp:
         except OSError as error:
             messagebox.showerror("打开失败", str(error), parent=self.root)
 
+    def _persist_mod_settings(self, mod_settings: dict[str, dict[str, str]]) -> None:
+        self.mod_settings = mod_settings
+        self._persist_settings()
+
+    def _persist_trainer_settings(self, trainer_settings: dict[str, dict]) -> None:
+        self.trainer_settings = trainer_core.normalize_trainer_settings(trainer_settings)
+        self._persist_settings()
+
     def _on_close(self) -> None:
         if self.slim_running:
             messagebox.showinfo("任务进行中", "存档瘦身正在后台执行，请等待任务完成后再关闭程序。", parent=self.root)
             return
+        if self.trainer_panel is not None:
+            self.trainer_panel.close()
         self._persist_settings()
         self.root.destroy()
 

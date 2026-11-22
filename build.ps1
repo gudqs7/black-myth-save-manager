@@ -11,6 +11,7 @@ $icon = Join-Path $projectRoot "assets\logo.ico"
 $logo = Join-Path $projectRoot "assets\logo.png"
 $pbzBridge = Join-Path $projectRoot "native\pbz_bridge\pbz_bridge.dll"
 $pbzOodle = Join-Path $projectRoot "native\pbz_bridge\oo2core_9_win64.dll"
+$speedhack = Join-Path $projectRoot "native\speedhack\TrSpeedHack_x64.dll"
 $outputDirectory = Join-Path $projectRoot $OutputDirectory
 
 $bridgeSource = Join-Path $projectRoot "native\pbz_bridge\pbz_bridge.cpp"
@@ -39,6 +40,8 @@ python -m PyInstaller `
     --add-data "$logo;assets" `
     --add-binary "$pbzBridge;native" `
     --add-binary "$pbzOodle;native" `
+    --add-binary "$speedhack;native" `
+    --collect-all keystone `
     --distpath $outputDirectory `
     $source
 

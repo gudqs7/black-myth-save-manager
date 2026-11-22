@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "black-myth-save-manager"
-version = "1.7.0"
-description = "A Windows GUI save manager for Black Myth: Wukong and Phantom Blade Zero."
+version = "1.9.3"
+description = "A Windows GUI save, Mod, and trainer manager for Black Myth: Wukong and Phantom Blade Zero."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -19,16 +19,18 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Games/Entertainment",
 ]
+dependencies = ["keystone-engine>=0.9.2"]
 
 [project.gui-scripts]
 black-myth-save-manager = "black_myth_save_manager:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-py-modules = ["black_myth_save_manager"]
+py-modules = ["black_myth_save_manager", "trainer_core"]
 
 [tool.setuptools.data-files]
 "native" = [
   "native/pbz_bridge/pbz_bridge.dll",
   "native/pbz_bridge/oo2core_9_win64.dll",
+  "native/speedhack/TrSpeedHack_x64.dll",
 ]

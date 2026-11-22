@@ -590,6 +590,139 @@ bool find_targets(std::wstring& error) {
     return true;
 }
 
+bool find_object_by_class_name(
+    const FName& class_name, void*& live_object, void*& fallback_object) {
+    live_object = nullptr;
+    fallback_object = nullptr;
+    for_each_uobject([&](void* object) {
+        void* cls = object_class(object);
+        if (!cls) return false;
+        if (!fname_equals(object_name(cls), class_name)) return false;
+        if ((object_flags(object) & kRFClassDefaultObject) == 0) {
+            live_object = object;
+            return true;
+        }
+        if (!fallback_object) fallback_object = object;
+        return false;
+    });
+    return live_object != nullptr || fallback_object != nullptr;
+}
+
+bool find_property_offset(
+    void* cls, const FName& property_name, uint32_t& value_offset, std::wstring& error) {
+    value_offset = 0;
+    if (!cls) {
+        error = L"目标 UClass 为空";
+        return false;
+    }
+    auto* property = *reinterpret_cast<unsigned char**>(static_cast<unsigned char*>(cls) + 0x50);
+    if (!property) {
+        error = L"目标 UClass 属性表不可用";
+        return false;
+    }
+    constexpr size_t kPropertyStride = 0x80;
+    constexpr size_t kPropertyNameOffset = 0x20;
+    constexpr size_t kPropertyOffsetInternal = 0x44;
+    constexpr size_t kMaxProperties = 0x2000;
+    for (size_t index = 0; index < kMaxProperties; ++index) {
+        auto* entry = property + index * kPropertyStride;
+        auto name = *reinterpret_cast<FName*>(entry + kPropertyNameOffset);
+        if (name.index != property_name.index) continue;
+        value_offset = *reinterpret_cast<uint32_t*>(entry + kPropertyOffsetInternal);
+        if (value_offset > 0 && value_offset < 0x10000) return true;
+        break;
+    }
+    error = L"未找到目标属性";
+    return false;
+}
+
+bool unlock_nightmare(std::wstring& error) {
+    if (!validate_game_build(error)) return false;
+    if (!validate_object_array(error)) return false;
+
+    FName game_system_name = make_fname(L"PBZGameSystem");
+    FName nightmare_name = make_fname(L"bCanSelectNightMare");
+    if (game_system_name.index == 0 || nightmare_name.index == 0) {
+        error = L"FName 构造失败，无法定位六十六天难度";
+        return false;
+    }
+
+    void* live_game_system = nullptr;
+    void* fallback_game_system = nullptr;
+    find_object_by_class_name(game_system_name, live_game_system, fallback_game_system);
+
+    void* game_system = live_game_system ? live_game_system : fallback_game_system;
+    if (!game_system) {
+        error = L"未找到 PBZGameSystem，请先进入游戏标题界面";
+        return false;
+    }
+
+    void* cls = object_class(game_system);
+    uint32_t value_offset = 0;
+    if (!find_property_offset(cls, nightmare_name, value_offset, error)) {
+        error = L"未找到 bCanSelectNightMare 属性";
+        return false;
+    }
+
+    *reinterpret_cast<uint8_t*>(static_cast<unsigned char*>(game_system) + value_offset) = 1;
+    append_log(g_current_log_path,
+               "bridge: unlock nightmare object=" + std::to_string(reinterpret_cast<uintptr_t>(game_system)) +
+                   " offset=" + std::to_string(value_offset) + "\r\n");
+    return true;
+}
+
+bool query_trainer_value(const std::wstring& query, uint32_t& result, std::wstring& error) {
+    if (!validate_game_build(error)) return false;
+    if (!validate_object_array(error)) return false;
+    constexpr uint32_t kFailure = 0xFFFFFFFF;
+
+    if (query.rfind(L"fname:", 0) == 0) {
+        FName name = make_fname(query.c_str() + 6);
+        if (name.index == 0) {
+            error = L"FName 构造失败";
+            result = kFailure;
+            return false;
+        }
+        result = name.index;
+        return true;
+    }
+    if (query.rfind(L"prop:", 0) == 0) {
+        auto body = query.substr(5);
+        size_t split = body.find(L'|');
+        if (split == std::wstring::npos) {
+            error = L"属性查询格式无效";
+            result = kFailure;
+            return false;
+        }
+        FName class_name = make_fname(body.substr(0, split).c_str());
+        FName property_name = make_fname(body.substr(split + 1).c_str());
+        if (class_name.index == 0 || property_name.index == 0) {
+            error = L"FName 构造失败";
+            result = kFailure;
+            return false;
+        }
+        void* live_object = nullptr;
+        void* fallback_object = nullptr;
+        find_object_by_class_name(class_name, live_object, fallback_object);
+        void* object = live_object ? live_object : fallback_object;
+        if (!object) {
+            error = L"未找到目标 UClass";
+            result = kFailure;
+            return false;
+        }
+        uint32_t offset = 0;
+        if (!find_property_offset(object_class(object), property_name, offset, error)) {
+            result = kFailure;
+            return false;
+        }
+        result = offset;
+        return true;
+    }
+    error = L"未知查询";
+    result = kFailure;
+    return false;
+}
+
 bool inject_slot(const SlotData& slot) {
     std::wstring slot_name = utf8_to_wide(slot.name);
     if (slot_name.empty()) return false;
@@ -810,6 +943,23 @@ extern "C" __declspec(dllexport) DWORD WINAPI PBZ_RunJobW(LPCWSTR job_path) {
     std::lock_guard<std::mutex> lock(g_run_mutex);
     if (path.empty()) return 2;
     return run_job(path) ? 0 : 1;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI PBZ_UnlockNightmareW() {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    std::wstring error;
+    return unlock_nightmare(error) ? 0 : 1;
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI PBZ_QueryTrainerValueW(LPCWSTR query) {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    std::wstring error;
+    uint32_t result = 0xFFFFFFFF;
+    if (!query || !query_trainer_value(query, result, error)) {
+        append_log(g_current_log_path, "bridge: trainer query failed\r\n");
+        return 0xFFFFFFFF;
+    }
+    return result;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {

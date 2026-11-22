@@ -5,6 +5,7 @@ __pycache__/
 venv/
 build/
 dist/
+dist-*/
 *.spec
 *.log
 .DS_Store
